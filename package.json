@@ -1,0 +1,46 @@
+{
+  "name": "ogmara-newsbot",
+  "version": "0.1.0",
+  "description": "Self-hostable bot that publishes AI-composed posts to the Ogmara News Feed",
+  "type": "module",
+  "bin": {
+    "ogmara-newsbot": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "ogmara",
+    "klever",
+    "bot",
+    "news",
+    "ai",
+    "decentralized"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Test0rMaik/ogmara-newsbot"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@ogmara/sdk": "^0.49.0",
+    "dotenv": "^17.4.2",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}

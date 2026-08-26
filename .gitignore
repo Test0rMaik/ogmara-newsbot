@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Secrets — NEVER commit. The wallet key here controls a real Klever identity.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Operator's own config (config.example.yaml is the committed template)
+config.yaml
+config.yml
+
+# Bot state
+data/
+*.sqlite
+*.sqlite-journal
+*.db
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

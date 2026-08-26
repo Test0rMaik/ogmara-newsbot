@@ -1,0 +1,48 @@
+# ogmara-newsbot configuration
+#
+# Copy this file to config.yaml and edit. Secrets do NOT belong here — the
+# wallet key and AI API keys come from the environment (see .env.example), so
+# this file stays safe to share when asking for help.
+
+node:
+  # The Ogmara L2 node to publish through. Your posting limits are set by this
+  # node — rate limits are enforced at the ingress node only.
+  url: https://darkw0rld.mine.nu
+
+  # Must match the node's network, or every signature is rejected.
+  network: testnet
+
+  # Request timeout in milliseconds.
+  timeoutMs: 30000
+
+posting:
+  # When true, posts are composed and printed but never published.
+  # This is the default on purpose: news posts propagate across the whole mesh
+  # and cannot be truly unpublished. Set to false only once you have reviewed
+  # real dry-run output and are happy with it.
+  dryRun: true
+
+  # Voluntary content rating: general | teen | mature | explicit
+  contentRating: general
+
+  # The bot's own posting cadence. Must be at most 80% of nodeNewsLimitPerHour
+  # so there is headroom for retries — the bot refuses to start otherwise.
+  maxPostsPerHour: 1
+
+  # What the node will actually allow per wallet per hour. The reference node
+  # currently allows 5 and does not expose this over the API, so it has to be
+  # configured. Raise it if you run a node with a higher ceiling.
+  nodeNewsLimitPerHour: 5
+
+  # Tag marking posts as bot-authored. Readers of a decentralized feed should
+  # be able to tell automated posts apart, so this is on by default. Set to
+  # null only if you disclose some other way.
+  disclosureTag: bot
+
+  # Tags added to every post, ranked ahead of AI suggestions. The protocol caps
+  # a post at 10 tags total.
+  alwaysTags: []
+
+  # Append the source article link on feed-derived posts. Strongly recommended:
+  # summarise and link rather than republishing someone else's reporting.
+  includeSourceLink: true
