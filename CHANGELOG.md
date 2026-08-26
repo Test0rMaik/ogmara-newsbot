@@ -5,6 +5,76 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-26
+
+P2 — posts are now written by an AI provider of the operator's choice, and a
+retry queue makes rate limits cost nothing extra.
+
+### Added
+
+- **AI provider abstraction** (`src/ai/`) — four providers behind one
+  interface, so switching is a config change:
+  - `anthropic` (Claude, default), `openai` (GPT), `gemini`, and
+    `openai-compatible` for Ollama / LM Studio / vLLM / OpenRouter. The last one
+    means the bot can run with **no cloud AI dependency at all**.
+  - Every provider uses its native **structured output** mode against a shared
+    JSON schema. No prose parsing — that is the usual source of flaky output in
+    bots like this, and it fails silently, publishing a malformed post rather
+    than rejecting it.
+  - **A content decline is a normal outcome, not an error.** Each provider maps
+    its own refusal signal — Claude's `stop_reason: "refusal"` (an HTTP 200,
+    with empty or partial content that naive code indexes into and crashes on),
+    OpenAI's `content_filter` finish reason, Gemini's `promptFeedback.blockReason`
+    *and* candidate `finishReason`, which report input-side and output-side
+    blocks in different places. A bot summarising world news brushes against
+    cybersecurity and life-sciences classifiers regularly, so an unattended
+    process must skip the item and continue.
+  - The Anthropic provider enables server-side fallbacks (`fallbacks: "default"`),
+    so a declined request is retried on a fallback model inside the same call —
+    rescuing posts that would otherwise be dropped. Only a whole-chain refusal
+    reaches the caller.
+- **Editable prompt templates** (`prompts/news.md`) — the prompt is where an
+  operator gives their bot its voice, so it lives in Markdown rather than a
+  string literal. Substitution is deliberately logic-free `{{NAME}}`; an unknown
+  placeholder is a startup error, since a typo'd `{{PUBLISER}}` would otherwise
+  ship to the model as literal text and produce a subtly wrong post with no
+  indication why.
+- **Retry queue** (`src/queue.ts`) — when the node rate-limits a post, the
+  **composed** post is queued and retried later, and queued posts are published
+  before anything new is composed.
+  - Storing the composed post rather than the source candidate is the point:
+    recomposing would mean paying for a second AI call for output already
+    produced, and an item that scrolls out of the feed meanwhile would be lost
+    entirely.
+  - Entries expire (24h default) and give up after N attempts. Expiry is
+    evaluated on read as well as write, so a queue that sat through an outage
+    doesn't hand back stale news.
+  - Unlike the ledger, a corrupt queue warns and starts empty rather than
+    refusing to start — losing a few pending posts is recoverable, a reset
+    ledger reposts everything.
+- Refusals are recorded in the ledger so a declined item is not re-composed —
+  and re-billed — on every subsequent run.
+- `ai` and `queue` config sections; `docs/AI-PROVIDERS.md`.
+
+### Changed
+
+- The placeholder composer is replaced by the AI composer. Attribution is still
+  appended by the bot **after** composition rather than requested in the prompt:
+  models reword URLs, and a mangled source link is worse than none.
+- The protocol title cap is enforced after composition. The prompt asks the
+  model to respect it, but that is guidance to a model, not a guarantee.
+
+### Notes
+
+- 121 tests. Verified end-to-end against live BBC/Guardian feeds through a mock
+  OpenAI-compatible server, which confirmed the request shape (strict
+  `json_schema`, `maxTags` flowing from config into the schema, rendered
+  prompt) and the full compose → tag-merge → attribution → render chain.
+- **The three vendor APIs are not live-verified** — no API keys were available
+  in the session that wrote them. They are built from current provider
+  documentation and typecheck against each vendor's official SDK, but the first
+  real call against Anthropic, OpenAI and Gemini is unverified.
+
 ## [0.2.0] - 2026-08-26
 
 P1 — the bot now reads real feeds and posts on a schedule, without duplicates.

@@ -13,6 +13,10 @@ import { MAX_CONTENT_CHARS, MAX_TITLE_BYTES, type Config, type Secrets } from '.
 
 const UTF8 = new TextEncoder();
 
+// Re-exported so the pipeline enforces the protocol cap without importing the
+// config module for a constant.
+export { MAX_TITLE_BYTES } from './config.js';
+
 /** A post ready to publish, already tag-normalized. */
 export interface ComposedPost {
   title: string;

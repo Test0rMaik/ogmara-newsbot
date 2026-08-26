@@ -8,9 +8,12 @@
  */
 
 import { config as loadDotenv } from 'dotenv';
+import { AiConfigError, createProvider } from './ai/index.js';
+import { loadTemplate } from './ai/prompt.js';
 import { ConfigError, loadConfig, loadSecrets, type Config, type Secrets } from './config.js';
 import { Ledger } from './ledger.js';
 import { InvalidPostError, OgmaraPublisher, type ComposedPost } from './ogmara.js';
+import { PostQueue } from './queue.js';
 import { runOnce, type RunOutcome } from './pipeline.js';
 import { schedule, type ScheduledJob } from './scheduler.js';
 import { RssSource } from './sources/rss.js';
@@ -111,13 +114,24 @@ function reportOutcome(outcome: RunOutcome, address: string): void {
       console.log('Dry run — set posting.dryRun: false to publish for real.');
       break;
     case 'posted':
-      console.log(`Published "${outcome.title}" — msg_id ${outcome.msgId}`);
+      console.log(
+        `Published${outcome.fromQueue ? ' (from queue)' : ''} "${outcome.title}" — msg_id ${outcome.msgId}`,
+      );
       break;
     case 'nothing-new':
       console.log(`Nothing new to post (${outcome.polled} candidates, all seen).`);
       break;
+    case 'refused':
+      console.log(
+        `Model declined to write about "${outcome.title}"` +
+          `${outcome.category !== undefined ? ` (${outcome.category})` : ''} — skipping it.`,
+      );
+      break;
     case 'rate-limited':
-      console.log(`Rate limited — next slot in ${Math.ceil(outcome.retryAfterMs / 1000)}s.`);
+      console.log(
+        `Rate limited — next slot in ${Math.ceil(outcome.retryAfterMs / 1000)}s. ` +
+          `${outcome.queued} post(s) queued for retry.`,
+      );
       break;
   }
 }
@@ -142,6 +156,18 @@ async function run(args: CliArgs): Promise<number> {
   const ledger = Ledger.load(effective.storage.ledgerPath, effective.storage.retentionDays);
   console.log(`Ledger:  ${effective.storage.ledgerPath} (${ledger.size} entries)`);
 
+  const queue = PostQueue.load(
+    effective.queue.path,
+    effective.queue.maxAttempts,
+    effective.queue.maxAgeHours,
+  );
+  console.log(`Queue:   ${effective.queue.path} (${queue.size} pending)`);
+
+  const provider = createProvider(effective.ai, secrets);
+  console.log(`AI:      ${provider.id} / ${provider.model}`);
+
+  const template = loadTemplate(effective.ai.promptPath);
+
   const sources = buildSources(effective);
   if (sources.length === 0) {
     console.error(
@@ -156,7 +182,7 @@ async function run(args: CliArgs): Promise<number> {
       : `Mode:    LIVE — up to ${effective.posting.maxPostsPerHour} post(s)/hour`,
   );
 
-  const deps = { config: effective, sources, ledger, publisher };
+  const deps = { config: effective, sources, ledger, queue, publisher, provider, template };
 
   if (args.once) {
     reportOutcome(await runOnce(deps), publisher.address);
@@ -211,7 +237,11 @@ async function main(): Promise<void> {
   } catch (err) {
     // Config and payload problems are the operator's to fix and deserve a
     // clean message; anything else is a genuine fault and keeps its stack.
-    if (err instanceof ConfigError || err instanceof InvalidPostError) {
+    if (
+      err instanceof ConfigError ||
+      err instanceof InvalidPostError ||
+      err instanceof AiConfigError
+    ) {
       console.error(`\n${err.name}: ${err.message}`);
       process.exitCode = 2;
       return;

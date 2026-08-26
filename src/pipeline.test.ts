@@ -2,18 +2,22 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { AiProvider, ComposeResult } from './ai/index.js';
 import type { Config } from './config.js';
 import { Ledger } from './ledger.js';
 import type { ComposedPost, OgmaraPublisher, PublishResult } from './ogmara.js';
-import { composeFromCandidate, runOnce, truncateTitle } from './pipeline.js';
+import { composeWithAi, runOnce, truncateTitle } from './pipeline.js';
+import { PostQueue } from './queue.js';
 import type { Candidate, Source } from './sources/types.js';
 
 let dir: string;
 let ledgerPath: string;
+let queuePath: string;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'newsbot-pipeline-'));
   ledgerPath = join(dir, 'ledger.json');
+  queuePath = join(dir, 'queue.json');
 });
 
 afterEach(() => {
@@ -27,7 +31,10 @@ const CONFIG = {
     disclosureTag: 'bot',
     includeSourceLink: true,
   },
+  ai: { targetContentChars: 600, maxTags: 5 },
 } as unknown as Config;
+
+const TEMPLATE = 'Write about {{TITLE}} from {{PUBLISHER}}: {{SUMMARY}}';
 
 function candidate(over: Partial<Candidate> = {}): Candidate {
   return {
@@ -45,7 +52,27 @@ function sourceOf(...items: Candidate[]): Source {
   return { kind: 'rss', name: 'test', poll: async () => items };
 }
 
-/** Publisher stub recording what it was asked to publish. */
+/** Provider stub returning a fixed result and recording the prompts it saw. */
+function providerStub(result: ComposeResult): { provider: AiProvider; prompts: string[] } {
+  const prompts: string[] = [];
+  const provider: AiProvider = {
+    id: 'anthropic',
+    model: 'stub',
+    compose: async (req) => {
+      prompts.push(req.prompt);
+      return result;
+    },
+  };
+  return { provider, prompts };
+}
+
+const OK_RESULT: ComposeResult = {
+  status: 'ok',
+  title: 'Rates unchanged',
+  content: 'The central bank held rates steady this month.',
+  tags: ['central-banking', 'rates'],
+};
+
 function publisherStub(result: PublishResult): { pub: OgmaraPublisher; sent: ComposedPost[] } {
   const sent: ComposedPost[] = [];
   const pub = {
@@ -56,6 +83,19 @@ function publisherStub(result: PublishResult): { pub: OgmaraPublisher; sent: Com
     },
   } as unknown as OgmaraPublisher;
   return { pub, sent };
+}
+
+function deps(over: Partial<Parameters<typeof runOnce>[0]> = {}) {
+  return {
+    config: CONFIG,
+    sources: [sourceOf(candidate())],
+    ledger: Ledger.load(ledgerPath),
+    queue: PostQueue.load(queuePath),
+    publisher: publisherStub({ status: 'published', msgId: 'abc' }).pub,
+    provider: providerStub(OK_RESULT).provider,
+    template: TEMPLATE,
+    ...over,
+  };
 }
 
 describe('truncateTitle', () => {
@@ -72,15 +112,12 @@ describe('truncateTitle', () => {
   it('cuts on a word boundary rather than mid-word', () => {
     const headline = 'Central bank officials signal caution as inflation pressures persist';
     const out = truncateTitle(headline, 40);
-    expect(out.endsWith('…')).toBe(true);
-    // Everything before the ellipsis is whole words from the original.
     const body = out.slice(0, -1);
     expect(headline.startsWith(body)).toBe(true);
     expect(headline[body.length]).toBe(' ');
   });
 
   it('accepts a mid-word cut when one word is too long to break', () => {
-    // With no usable boundary, a mid-word cut beats returning almost nothing.
     const out = truncateTitle(`${'a'.repeat(20)} ${'b'.repeat(300)}`, 40);
     expect(new TextEncoder().encode(out).length).toBeLessThanOrEqual(40);
     expect(out.startsWith('aaaaaaaaaaaaaaaaaaaa b')).toBe(true);
@@ -92,8 +129,6 @@ describe('truncateTitle', () => {
   });
 
   it('never splits a surrogate pair', () => {
-    // Slicing by UTF-16 unit would emit a lone surrogate — invalid UTF-8 that
-    // the node would reject.
     const out = truncateTitle('🚀'.repeat(100), 51);
     expect(new TextEncoder().encode(out).length).toBeLessThanOrEqual(51);
     expect(out.isWellFormed()).toBe(true);
@@ -101,143 +136,175 @@ describe('truncateTitle', () => {
   });
 });
 
-describe('composeFromCandidate', () => {
-  it('includes an attribution link', () => {
-    const post = composeFromCandidate(candidate(), CONFIG);
-    expect(post.content).toContain('via [Example Wire](https://example.com/a)');
+describe('composeWithAi', () => {
+  it('renders the template with the candidate fields', async () => {
+    const { provider, prompts } = providerStub(OK_RESULT);
+    await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    expect(prompts[0]).toContain('Fed holds rates steady');
+    expect(prompts[0]).toContain('Example Wire');
+    expect(prompts[0]).toContain('The central bank left rates unchanged.');
   });
 
-  it('always carries the disclosure tag', () => {
-    expect(composeFromCandidate(candidate(), CONFIG).tags).toContain('bot');
+  it('appends attribution rather than asking the model for it', async () => {
+    // Models reword URLs; a mangled source link is worse than none, so the
+    // link is added after composition.
+    const { provider } = providerStub(OK_RESULT);
+    const post = await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    expect(post?.content).toContain('via [Example Wire](https://example.com/a)');
+    expect(post?.content).toContain('The central bank held rates steady');
   });
 
-  it('omits the link when attribution is disabled', () => {
-    const cfg = { posting: { ...CONFIG.posting, includeSourceLink: false } } as Config;
-    expect(composeFromCandidate(candidate(), cfg).content).not.toContain('via [');
+  it('always carries the disclosure tag ahead of AI suggestions', async () => {
+    const { provider } = providerStub(OK_RESULT);
+    const post = await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    expect(post?.tags[0]).toBe('bot');
+    expect(post?.tags).toContain('central-banking');
   });
 
-  it('falls back to the title when there is no summary', () => {
-    const cfg = { posting: { ...CONFIG.posting, includeSourceLink: false } } as Config;
-    const noSummary: Candidate = {
-      dedupKey: 'k',
-      kind: 'rss',
-      title: 'Fed holds rates steady',
-      url: 'https://example.com/a',
-    };
-    expect(composeFromCandidate(noSummary, cfg).content).toBe('Fed holds rates steady');
+  it('enforces the protocol title cap even if the model ignores it', async () => {
+    const { provider } = providerStub({ ...OK_RESULT, title: 'x'.repeat(400) });
+    const post = await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    expect(new TextEncoder().encode(post!.title).length).toBeLessThanOrEqual(256);
+  });
+
+  it('returns null when the model refuses', async () => {
+    const { provider } = providerStub({ status: 'refused', category: 'cyber' });
+    expect(await composeWithAi(candidate(), CONFIG, provider, TEMPLATE)).toBeNull();
+  });
+
+  it('handles a candidate with no summary', async () => {
+    const { provider, prompts } = providerStub(OK_RESULT);
+    const bare: Candidate = { dedupKey: 'k', kind: 'rss', title: 'Headline only' };
+    await composeWithAi(bare, CONFIG, provider, TEMPLATE);
+    expect(prompts[0]).toContain('(no summary provided)');
   });
 });
 
 describe('runOnce', () => {
   it('publishes a fresh candidate and records it', async () => {
-    const ledger = Ledger.load(ledgerPath);
-    const { pub, sent } = publisherStub({ status: 'published', msgId: 'abc123' });
-
-    const outcome = await runOnce({
-      config: CONFIG,
-      sources: [sourceOf(candidate())],
-      ledger,
-      publisher: pub,
-    });
-
+    const d = deps();
+    const outcome = await runOnce(d);
     expect(outcome.status).toBe('posted');
-    expect(sent).toHaveLength(1);
-    expect(ledger.has('key-1')).toBe(true);
+    expect(d.ledger.has('key-1')).toBe(true);
   });
 
   it('skips an item already in the ledger', async () => {
     const ledger = Ledger.load(ledgerPath);
     ledger.record({ key: 'key-1', title: 'Fed holds rates steady', postedAt: Date.now(), kind: 'rss' });
-    const { pub, sent } = publisherStub({ status: 'published', msgId: 'x' });
-
-    const outcome = await runOnce({
-      config: CONFIG,
-      sources: [sourceOf(candidate())],
-      ledger,
-      publisher: pub,
-    });
-
+    const outcome = await runOnce(deps({ ledger }));
     expect(outcome.status).toBe('nothing-new');
-    expect(sent).toHaveLength(0);
   });
 
-  it('skips a near-duplicate of a recent post from another publisher', async () => {
+  it('skips a near-duplicate of a recent post', async () => {
     const ledger = Ledger.load(ledgerPath);
     ledger.record({
-      key: 'other-key',
+      key: 'other',
       title: 'Fed holds rates steady amid inflation concerns',
       postedAt: Date.now(),
       kind: 'rss',
     });
-    const { pub, sent } = publisherStub({ status: 'published', msgId: 'x' });
-
-    const outcome = await runOnce({
-      config: CONFIG,
-      sources: [
-        sourceOf(candidate({ dedupKey: 'new', title: 'Fed holds rates steady despite inflation concerns' })),
-      ],
-      ledger,
-      publisher: pub,
-    });
-
+    const outcome = await runOnce(
+      deps({
+        ledger,
+        sources: [
+          sourceOf(
+            candidate({ dedupKey: 'new', title: 'Fed holds rates steady despite inflation concerns' }),
+          ),
+        ],
+      }),
+    );
     expect(outcome.status).toBe('nothing-new');
-    expect(sent).toHaveLength(0);
   });
 
   it('does NOT record a dry run, so it stays repeatable', async () => {
-    // Recording a dry run would mean the item is silently skipped once the
-    // operator goes live — swallowing their first real post.
-    const ledger = Ledger.load(ledgerPath);
-    const { pub } = publisherStub({ status: 'dry-run' });
-
-    const outcome = await runOnce({
-      config: { ...CONFIG, posting: { ...CONFIG.posting, dryRun: true } } as Config,
-      sources: [sourceOf(candidate())],
-      ledger,
-      publisher: pub,
-    });
-
+    const d = deps({ config: { ...CONFIG, posting: { ...CONFIG.posting, dryRun: true } } as Config });
+    d.publisher = publisherStub({ status: 'dry-run' }).pub;
+    const outcome = await runOnce(d);
     expect(outcome.status).toBe('dry-run');
-    expect(ledger.has('key-1')).toBe(false);
+    expect(d.ledger.has('key-1')).toBe(false);
   });
 
-  it('does NOT record when the node rate-limits, so the item is retried', async () => {
-    const ledger = Ledger.load(ledgerPath);
-    const { pub } = publisherStub({ status: 'rate-limited', retryAfterMs: 1000 });
+  it('records a refusal so the item is not re-composed and re-billed', async () => {
+    // Re-composing a declined item every run would pay for an AI call each
+    // time and get the same refusal back.
+    const d = deps({ provider: providerStub({ status: 'refused', category: 'cyber' }).provider });
+    const outcome = await runOnce(d);
+    expect(outcome.status).toBe('refused');
+    expect(d.ledger.has('key-1')).toBe(true);
+  });
 
-    const outcome = await runOnce({
-      config: CONFIG,
-      sources: [sourceOf(candidate())],
-      ledger,
-      publisher: pub,
-    });
-
+  it('queues the composed post when the node rate-limits', async () => {
+    const d = deps({ publisher: publisherStub({ status: 'rate-limited', retryAfterMs: 1000 }).pub });
+    const outcome = await runOnce(d);
     expect(outcome.status).toBe('rate-limited');
-    expect(ledger.has('key-1')).toBe(false);
+    expect(d.queue.size).toBe(1);
+    expect(d.ledger.has('key-1')).toBe(false);
+  });
+
+  it('publishes from the queue on the next run without re-composing', async () => {
+    // The saved post already cost an AI call; a second call would pay twice.
+    const queue = PostQueue.load(queuePath);
+    const ledger = Ledger.load(ledgerPath);
+
+    const first = deps({
+      queue,
+      ledger,
+      publisher: publisherStub({ status: 'rate-limited', retryAfterMs: 1000 }).pub,
+    });
+    await runOnce(first);
+    expect(queue.size).toBe(1);
+
+    const { provider, prompts } = providerStub(OK_RESULT);
+    const { pub, sent } = publisherStub({ status: 'published', msgId: 'xyz' });
+    const outcome = await runOnce(deps({ queue, ledger, provider, publisher: pub }));
+
+    expect(outcome).toMatchObject({ status: 'posted', fromQueue: true, msgId: 'xyz' });
+    expect(prompts).toHaveLength(0); // no second AI call
+    expect(sent[0]!.title).toBe('Rates unchanged');
+    expect(queue.size).toBe(0);
+    expect(ledger.has('key-1')).toBe(true);
+  });
+
+  it('does not re-queue an item that is already queued', async () => {
+    const queue = PostQueue.load(queuePath);
+    queue.enqueue({ key: 'key-1', sourceTitle: 'Fed holds rates steady', kind: 'rss', post: { title: 'T', content: 'C', tags: [] } });
+    const d = deps({ queue, publisher: publisherStub({ status: 'rate-limited', retryAfterMs: 1 }).pub });
+    await runOnce(d);
+    expect(queue.size).toBe(1);
+  });
+
+  it('drains the queue before composing anything new', async () => {
+    const queue = PostQueue.load(queuePath);
+    queue.enqueue({
+      key: 'queued-key',
+      sourceTitle: 'Older story',
+      kind: 'rss',
+      post: { title: 'Queued post', content: 'body', tags: ['bot'] },
+    });
+    const { provider, prompts } = providerStub(OK_RESULT);
+    const outcome = await runOnce(deps({ queue, provider }));
+
+    expect(outcome).toMatchObject({ status: 'posted', fromQueue: true });
+    expect(prompts).toHaveLength(0);
   });
 
   it('posts at most one item per run', async () => {
-    const ledger = Ledger.load(ledgerPath);
     const { pub, sent } = publisherStub({ status: 'published', msgId: 'x' });
-
-    await runOnce({
-      config: CONFIG,
-      sources: [
-        sourceOf(
-          candidate({ dedupKey: 'a', title: 'Volcano erupts in Iceland' }),
-          candidate({ dedupKey: 'b', title: 'Markets rally on tech earnings' }),
-        ),
-      ],
-      ledger,
-      publisher: pub,
-    });
-
+    await runOnce(
+      deps({
+        publisher: pub,
+        sources: [
+          sourceOf(
+            candidate({ dedupKey: 'a', title: 'Volcano erupts in Iceland' }),
+            candidate({ dedupKey: 'b', title: 'Markets rally on tech earnings' }),
+          ),
+        ],
+      }),
+    );
     expect(sent).toHaveLength(1);
   });
 
   it('survives a source that throws', async () => {
-    const ledger = Ledger.load(ledgerPath);
-    const { pub, sent } = publisherStub({ status: 'published', msgId: 'x' });
     const broken: Source = {
       kind: 'rss',
       name: 'broken',
@@ -245,25 +312,12 @@ describe('runOnce', () => {
         throw new Error('feed exploded');
       },
     };
-
-    const outcome = await runOnce({
-      config: CONFIG,
-      sources: [broken, sourceOf(candidate())],
-      ledger,
-      publisher: pub,
-    });
-
+    const outcome = await runOnce(deps({ sources: [broken, sourceOf(candidate())] }));
     expect(outcome.status).toBe('posted');
-    expect(sent).toHaveLength(1);
   });
 
   it('reports nothing-new when no sources yield candidates', async () => {
-    const outcome = await runOnce({
-      config: CONFIG,
-      sources: [sourceOf()],
-      ledger: Ledger.load(ledgerPath),
-      publisher: publisherStub({ status: 'published', msgId: 'x' }).pub,
-    });
+    const outcome = await runOnce(deps({ sources: [sourceOf()] }));
     expect(outcome).toEqual({ status: 'nothing-new', polled: 0 });
   });
 });

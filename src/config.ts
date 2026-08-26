@@ -111,6 +111,48 @@ const sourcesSchema = z.object({
   rss: rssSourceSchema.prefault({}),
 });
 
+const aiSchema = z
+  .object({
+    provider: z.enum(['anthropic', 'openai', 'gemini', 'openai-compatible']).default('anthropic'),
+    /**
+     * Model identifier. Provider-specific — see docs/AI-PROVIDERS.md.
+     * Defaults to Claude Opus 5; change it to trade capability for cost.
+     */
+    model: z.string().min(1).default('claude-opus-5'),
+    /**
+     * Endpoint override, required for `openai-compatible`. This is what makes
+     * Ollama, OpenRouter, vLLM and other local servers work.
+     */
+    baseUrl: z.url({ protocol: /^https?$/ }).optional(),
+    /**
+     * Thinking depth and token spend (Anthropic only; ignored elsewhere).
+     * Composing a post from a supplied summary is a short, scoped task, so the
+     * default is `low` — raise it if posts read shallowly.
+     */
+    effort: z.enum(['low', 'medium', 'high']).default('low'),
+    /** Output cap. A post is small; this is generous headroom, not a target. */
+    maxTokens: z.int().min(256).max(64_000).default(4096),
+    /** Prompt template used for feed-derived posts. */
+    promptPath: z.string().min(1).default('prompts/news.md'),
+    /** Rough body-length target handed to the model as guidance. */
+    targetContentChars: z.int().min(100).max(10_000).default(600),
+    /** How many tags to request. The protocol caps the final list at 10. */
+    maxTags: z.int().min(1).max(10).default(5),
+  })
+  .refine((a) => a.provider !== 'openai-compatible' || a.baseUrl !== undefined, {
+    message: 'ai.baseUrl is required when ai.provider is "openai-compatible"',
+    path: ['baseUrl'],
+  });
+
+const queueSchema = z.object({
+  /** Where composed-but-unpublished posts wait. */
+  path: z.string().min(1).default('data/queue.json'),
+  /** Give up on a post after this many failed publish attempts. */
+  maxAttempts: z.int().min(1).max(50).default(5),
+  /** Discard queued posts older than this — stale news is worse than none. */
+  maxAgeHours: z.int().min(1).max(720).default(24),
+});
+
 const storageSchema = z.object({
   /** Where the posted-items ledger lives. */
   ledgerPath: z.string().min(1).default('data/ledger.json'),
@@ -126,11 +168,16 @@ const configSchema = z.object({
   // remain the single source of truth. Lets an operator omit the whole block.
   posting: postingSchema.prefault({}),
   sources: sourcesSchema.prefault({}),
+  ai: aiSchema.prefault({}),
+  queue: queueSchema.prefault({}),
   storage: storageSchema.prefault({}),
 });
 
 /** Fully validated bot configuration (secrets excluded). */
 export type Config = z.infer<typeof configSchema>;
+
+/** The `ai` section, extracted for the provider factory. */
+export type AiConfig = Config['ai'];
 
 /** Secrets, sourced from the environment rather than the config file. */
 export interface Secrets {
@@ -141,6 +188,10 @@ export interface Secrets {
    * *is*, the identity every post is attributed to.
    */
   walletKeyHex: string;
+  /** AI provider keys. Only the configured provider's key is required. */
+  anthropicApiKey?: string | undefined;
+  openaiApiKey?: string | undefined;
+  geminiApiKey?: string | undefined;
 }
 
 /** Raised when config or secrets are invalid. Message is operator-facing. */
@@ -201,5 +252,13 @@ export function loadSecrets(env: NodeJS.ProcessEnv = process.env): Secrets {
         'This is the raw Ed25519 private key, not a mnemonic or a klv1... address.',
     );
   }
-  return { walletKeyHex: key.toLowerCase() };
+  return {
+    walletKeyHex: key.toLowerCase(),
+    // Read unconditionally; the provider factory enforces that the configured
+    // provider's key is present. Reading them all here means an operator can
+    // switch providers in the config without touching .env.
+    anthropicApiKey: env['ANTHROPIC_API_KEY']?.trim(),
+    openaiApiKey: env['OPENAI_API_KEY']?.trim(),
+    geminiApiKey: env['GEMINI_API_KEY']?.trim(),
+  };
 }

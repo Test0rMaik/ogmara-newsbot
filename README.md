@@ -7,10 +7,9 @@ Point it at news sources, your own topics, or a folder of images. It composes
 posts with the AI provider of your choice, adds hashtags, and publishes them to
 a decentralized feed under a wallet you control.
 
-> **Status: early development (v0.2.0).** The bot reads real RSS/Atom feeds and
-> posts them on a schedule without duplicates. Post prose is currently taken
-> from the feed's own summary — AI composition is next. See
-> [Roadmap](#roadmap).
+> **Status: early development (v0.3.0).** The bot reads real RSS/Atom feeds,
+> composes posts with the AI provider of your choice, and publishes them on a
+> schedule without duplicates. See [Roadmap](#roadmap).
 
 ## Why a dry run by default
 
@@ -88,6 +87,36 @@ sources:
         publisher: BBC News
 ```
 
+### Choosing an AI provider
+
+```yaml
+ai:
+  provider: anthropic        # or openai | gemini | openai-compatible
+  model: claude-opus-5
+```
+
+Four providers, one interface — switching is a config change. `openai-compatible`
+points at any server speaking the OpenAI API (Ollama, LM Studio, vLLM,
+OpenRouter), so the bot can run with **no cloud AI dependency at all**.
+
+Only your chosen provider's API key is needed. Full setup, cost notes and
+prompt customisation: **[docs/AI-PROVIDERS.md](docs/AI-PROVIDERS.md)**.
+
+The prompt lives in [`prompts/news.md`](prompts/news.md) as editable Markdown —
+that's where your bot gets its voice.
+
+### When the model declines
+
+Safety classifiers on current models cover cybersecurity and life-sciences
+topics, and real world news brushes against both. When a model declines an
+item, the bot logs it, marks it seen, and moves on:
+
+```
+Model declined to write about "..." (cyber) — skipping it.
+```
+
+Occasional on a general feed; not a bug.
+
 ### Duplicate handling
 
 Two separate protections, because they catch different problems:
@@ -101,6 +130,16 @@ Two separate protections, because they catch different problems:
 
 The record lives in `data/ledger.json`. Keep it alongside your config — deleting
 it makes the bot treat everything as new again.
+
+### Rate limits and the retry queue
+
+When the node throttles the bot, the **already-composed** post is parked in
+`data/queue.json` and published on a later run. It is never recomposed, so a
+throttled post never costs a second AI call — and an article that scrolls out of
+the feed while the bot waits still gets published.
+
+Queued posts are published before anything new is composed. They expire after
+24 hours by default, because stale news is worse than no news.
 
 ### Rate limits — the one setting people get wrong
 
@@ -135,7 +174,7 @@ npm run build                     # compile to dist/
 |---|---|---|
 | P0 | Config, wallet, node connection, publish pipeline, dry-run | **done** |
 | P1 | RSS source, dedup ledger, scheduler | **done** |
-| P2 | AI providers — Claude, OpenAI, Gemini, OpenAI-compatible | planned |
+| P2 | AI providers — Claude, OpenAI, Gemini, OpenAI-compatible | **done** |
 | P3 | Topic source, image-directory source, media upload | planned |
 | P4 | Rate-limit backoff, retries, structured logging | planned |
 | P5 | Local web control panel (setup wizard, preview, approval) | planned |
