@@ -16,6 +16,7 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
+import { isValidCron } from './scheduler.js';
 
 /**
  * Conservative default for the node's per-wallet news rate limit.
@@ -81,6 +82,42 @@ const postingSchema = z
     path: ['maxPostsPerHour'],
   });
 
+const feedSchema = z.object({
+  url: z.url({ protocol: /^https?$/ }),
+  /** Overrides the publisher name taken from the feed's own title. */
+  publisher: z.string().min(1).optional(),
+});
+
+const rssSourceSchema = z.object({
+  enabled: z.boolean().default(false),
+  /**
+   * Cron expression for how often to poll and post. Validated here so a typo
+   * stops startup instead of silently never firing.
+   */
+  schedule: z
+    .string()
+    .default('0 * * * *')
+    .refine(isValidCron, { message: 'not a valid cron expression' }),
+  feeds: z.array(feedSchema).default([]),
+  /** Ignore items older than this many days. 0 disables the check. */
+  maxAgeDays: z.int().min(0).max(365).default(2),
+  /** Per-feed fetch timeout. */
+  timeoutMs: z.int().min(1000).max(120_000).default(20_000),
+  /** Reject a feed response larger than this. Guards against a runaway feed. */
+  maxBytes: z.int().min(1024).max(50 * 1024 * 1024).default(5 * 1024 * 1024),
+});
+
+const sourcesSchema = z.object({
+  rss: rssSourceSchema.prefault({}),
+});
+
+const storageSchema = z.object({
+  /** Where the posted-items ledger lives. */
+  ledgerPath: z.string().min(1).default('data/ledger.json'),
+  /** Entries older than this are pruned. */
+  retentionDays: z.int().min(1).max(3650).default(90),
+});
+
 const configSchema = z.object({
   node: nodeSchema,
   // `prefault` rather than `default`: Zod 4's `.default()` takes an *output*
@@ -88,6 +125,8 @@ const configSchema = z.object({
   // `prefault` feeds `{}` through parsing instead, so the field defaults above
   // remain the single source of truth. Lets an operator omit the whole block.
   posting: postingSchema.prefault({}),
+  sources: sourcesSchema.prefault({}),
+  storage: storageSchema.prefault({}),
 });
 
 /** Fully validated bot configuration (secrets excluded). */

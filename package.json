@@ -1,6 +1,6 @@
 {
   "name": "ogmara-newsbot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Self-hostable bot that publishes AI-composed posts to the Ogmara News Feed",
   "type": "module",
   "bin": {
@@ -33,7 +33,9 @@
   },
   "dependencies": {
     "@ogmara/sdk": "^0.49.0",
+    "croner": "^10.0.1",
     "dotenv": "^17.4.2",
+    "fast-xml-parser": "^5.11.0",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
   },

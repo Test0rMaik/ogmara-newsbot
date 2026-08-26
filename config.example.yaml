@@ -46,3 +46,41 @@ posting:
   # Append the source article link on feed-derived posts. Strongly recommended:
   # summarise and link rather than republishing someone else's reporting.
   includeSourceLink: true
+
+sources:
+  # RSS / Atom feeds. Each scheduled run posts at most ONE item, so your
+  # cadence is set by the cron expression, not by how much a feed publishes.
+  rss:
+    enabled: true
+
+    # Standard 5-field cron. Validated at startup — a typo stops the bot
+    # rather than silently never firing.
+    #   "0 * * * *"     every hour on the hour
+    #   "*/30 * * * *"  every 30 minutes
+    #   "0 9,17 * * *"  09:00 and 17:00 daily
+    schedule: "0 * * * *"
+
+    # Skip items older than this many days. 0 disables the check.
+    # Keeps a first run from posting a week-old story.
+    maxAgeDays: 2
+
+    # Per-feed fetch timeout, and a hard cap on response size so one runaway
+    # feed cannot exhaust memory on an unattended bot.
+    timeoutMs: 20000
+    maxBytes: 5242880
+
+    # `publisher` overrides the name taken from the feed's own title, and is
+    # what appears in the post's attribution line.
+    feeds:
+      - url: https://feeds.bbci.co.uk/news/world/rss.xml
+        publisher: BBC News
+      - url: https://www.theguardian.com/world/rss
+        publisher: The Guardian
+
+storage:
+  # Record of what has already been posted. Deleting this file makes the bot
+  # treat everything as new again, so keep it with your config.
+  ledgerPath: data/ledger.json
+
+  # Entries older than this are pruned on save.
+  retentionDays: 90
