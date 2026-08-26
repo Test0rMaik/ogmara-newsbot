@@ -35,6 +35,16 @@ export interface LedgerEntry {
 interface LedgerFile {
   version: 1;
   entries: LedgerEntry[];
+  /**
+   * Consecutive compose-failure counts, keyed by dedup key.
+   *
+   * Separate from `entries` because a failure is not a publication: it must
+   * not suppress the item permanently the way an entry does, but it must be
+   * bounded so a single poisoned item cannot monopolise every run forever.
+   * Cleared as soon as the item succeeds or is given up on.
+   * (Audit 2026-08-26, M6.)
+   */
+  failures?: Record<string, number>;
 }
 
 /** Default retention. Older entries are pruned on save. */
@@ -55,12 +65,19 @@ export class Ledger {
   readonly #retentionMs: number;
   #entries: LedgerEntry[];
   #keys: Set<string>;
+  #failures: Map<string, number>;
 
-  private constructor(path: string, entries: LedgerEntry[], retentionDays: number) {
+  private constructor(
+    path: string,
+    entries: LedgerEntry[],
+    retentionDays: number,
+    failures: Record<string, number> = {},
+  ) {
     this.#path = path;
     this.#entries = entries;
     this.#keys = new Set(entries.map((e) => e.key));
     this.#retentionMs = retentionDays * 86_400_000;
+    this.#failures = new Map(Object.entries(failures));
   }
 
   /**
@@ -97,7 +114,16 @@ export class Ledger {
       throw new Error(`ledger at "${path}" has no entries array — refusing to start`);
     }
 
-    return new Ledger(path, parsed.entries, retentionDays);
+    if (parsed.version !== 1) {
+      // Written on every save but never read until now. A future schema change
+      // replaying an old file straight into publish() is the hazard this
+      // closes. (Audit 2026-08-26, M17.)
+      throw new Error(
+        `ledger at "${path}" has version ${String(parsed.version)}, expected 1 — ` +
+          'refusing to start rather than misread a different schema',
+      );
+    }
+    return new Ledger(path, parsed.entries, retentionDays, parsed.failures ?? {});
   }
 
   /** Whether this item has already been posted. */
@@ -121,10 +147,31 @@ export class Ledger {
 
   /** Record a posted item and persist immediately. */
   record(entry: LedgerEntry): void {
+    this.#failures.delete(entry.key);
     if (this.#keys.has(entry.key)) return;
     this.#entries.push(entry);
     this.#keys.add(entry.key);
     this.save();
+  }
+
+  /**
+   * Count one compose failure for an item and return the new total.
+   *
+   * Bounded retry rather than an immediate ledger entry: the compose path
+   * carries transient errors too, and the ledger has no un-record operation,
+   * so recording on the first failure would silently and permanently drop
+   * legitimate items. (Audit 2026-08-26, M6.)
+   */
+  recordFailure(key: string, _now: number = Date.now()): number {
+    const next = (this.#failures.get(key) ?? 0) + 1;
+    this.#failures.set(key, next);
+    this.save();
+    return next;
+  }
+
+  /** Consecutive compose failures recorded for an item. */
+  failureCount(key: string): number {
+    return this.#failures.get(key) ?? 0;
   }
 
   /**
@@ -139,7 +186,16 @@ export class Ledger {
     this.#entries = this.#entries.filter((e) => e.postedAt >= cutoff);
     this.#keys = new Set(this.#entries.map((e) => e.key));
 
-    const payload: LedgerFile = { version: 1, entries: this.#entries };
+    // Drop failure counters for items that have since been recorded or pruned,
+    // so the map cannot grow without bound.
+    for (const key of [...this.#failures.keys()]) {
+      if (this.#keys.has(key)) this.#failures.delete(key);
+    }
+    const payload: LedgerFile = {
+      version: 1,
+      entries: this.#entries,
+      failures: Object.fromEntries(this.#failures),
+    };
     const dir = dirname(this.#path);
     mkdirSync(dir, { recursive: true });
 

@@ -136,3 +136,19 @@ describe('parseFeed — malformed input', () => {
     expect(parseFeed('<rss version="2.0"><channel><title>T</title></channel></rss>')).toEqual([]);
   });
 });
+
+describe('stripHtml — hostile input (audit M2/SEC-N2)', () => {
+  it('handles a large run of unmatched "<" in linear time', () => {
+    // Previously quadratic: 400 KB of bare "<" took 92 seconds and froze the
+    // whole single-threaded bot.
+    const started = Date.now();
+    stripHtml('<'.repeat(400_000));
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('strips markup that only appears after entity decoding', () => {
+    // &lt;img&gt; survives the first tag pass as text, then decodes to real
+    // markup — a second pass is needed.
+    expect(stripHtml('a &lt;img src=x onerror=alert(1)&gt; b')).toBe('a b');
+  });
+});

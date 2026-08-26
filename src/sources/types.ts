@@ -38,8 +38,15 @@ export interface Source {
   readonly kind: SourceKind;
   /** Operator-facing name, used in logs. */
   readonly name: string;
-  /** Fetch the current set of candidates. Should not throw for a single bad item. */
-  poll(): Promise<Candidate[]>;
+  /**
+   * Fetch the current set of candidates plus any non-fatal problems.
+   *
+   * Returns warnings rather than just candidates because a dead or hijacked
+   * feed is otherwise indistinguishable from a quiet news day: the bot prints
+   * "Nothing new to post" forever while the one signal that would explain it
+   * is discarded. (Audit 2026-08-26, M11.)
+   */
+  poll(): Promise<PollResult>;
 }
 
 /** Result of polling one source, including partial failures. */

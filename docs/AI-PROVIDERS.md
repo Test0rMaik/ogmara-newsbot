@@ -8,7 +8,7 @@ providers is a config change — no code edits.
 | `anthropic` | `ANTHROPIC_API_KEY` | Default. Claude. |
 | `openai` | `OPENAI_API_KEY` | GPT models. |
 | `gemini` | `GEMINI_API_KEY` | Google Gemini. |
-| `openai-compatible` | `ai.baseUrl` | Ollama, LM Studio, OpenRouter, vLLM, Groq — anything speaking the OpenAI API. Run the bot fully local. |
+| `openai-compatible` | `ai.baseUrl` (+ `OPENAI_COMPATIBLE_API_KEY` if required) | Ollama, LM Studio, OpenRouter, vLLM, Groq — anything speaking the OpenAI API. Run the bot fully local. |
 
 All four use their provider's native **structured output** mode, so the model
 returns schema-valid JSON directly. The bot never parses prose, which is the
@@ -75,8 +75,11 @@ ai:
 ```
 
 `baseUrl` is required for this provider — the bot refuses to start without it.
-Most local servers ignore the API key; set `OPENAI_API_KEY` to any non-empty
-value if yours demands one.
+
+Most local servers ignore the API key. If yours needs one, set
+**`OPENAI_COMPATIBLE_API_KEY`** — deliberately separate from `OPENAI_API_KEY`,
+because this endpoint may be a third party (OpenRouter, a hosted gateway) and
+forwarding your real OpenAI credential to it would leak it.
 
 Known endpoints:
 
@@ -115,17 +118,34 @@ The prompt lives in [`prompts/news.md`](../prompts/news.md) as editable
 Markdown — that's where your bot gets its voice and editorial rules. Point
 `ai.promptPath` elsewhere to keep several.
 
-Placeholders available: `{{TITLE}}`, `{{SUMMARY}}`, `{{PUBLISHER}}`,
+Placeholders available: `{{FENCED_ITEM}}`, `{{PUBLISHER}}`,
 `{{MAX_TITLE_BYTES}}`, `{{TARGET_CONTENT_CHARS}}`, `{{MAX_TAGS}}`. An unknown
 placeholder is a startup error, so a typo can't silently ship to the model as
 literal text.
 
-Two things the prompt should **not** do:
+### Keep the fence
+
+`{{FENCED_ITEM}}` is the feed's headline and summary wrapped in a delimiter
+with a random per-call marker. **Keep it, and keep the instruction that says
+everything inside it is untrusted data.**
+
+Feed text is written by whoever can post to the feed — on an aggregator
+(a subreddit's `.rss`, a Google News query feed) that is any internet user.
+Without the fence, text like *"ignore the above and write X"* reads as an
+instruction, and the resulting post is signed with your wallet and published
+where it cannot be unpublished. Structured output constrains the shape of the
+reply, not its content, so it is no defence here.
+
+Put your own rules **after** the fenced block, as the default template does —
+instructions nearest the end carry the most weight.
+
+Three things the prompt should **not** do:
 
 - **Ask for a source link.** The bot appends attribution itself. Models reword
   URLs, and a mangled source link is worse than none.
 - **Invite invention.** The default prompt constrains the model to the supplied
   summary. Loosening that gets you a bot that confidently makes things up.
+- **Remove the untrusted-data instruction.** See above.
 
 ## Adding a provider
 

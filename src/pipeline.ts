@@ -12,7 +12,7 @@
  */
 
 import type { AiProvider } from './ai/index.js';
-import { loadTemplate, renderTemplate } from './ai/prompt.js';
+import { capText, fenceUntrusted, loadTemplate, newFenceMarker, renderTemplate } from './ai/prompt.js';
 import type { Config } from './config.js';
 import { isNearDuplicate } from './dedup.js';
 import { buildTags } from './hashtags.js';
@@ -27,7 +27,15 @@ export type RunOutcome =
   | { status: 'dry-run'; post: ComposedPost }
   | { status: 'nothing-new'; polled: number }
   | { status: 'refused'; title: string; category?: string | undefined }
-  | { status: 'rate-limited'; retryAfterMs: number; queued: number };
+  | { status: 'compose-failed'; title: string; reason: string }
+  | {
+      status: 'deferred';
+      /** Why publication was deferred, for an accurate operator message. */
+      cause: 'local-budget' | 'node-rate-limit' | 'transport';
+      retryAfterMs: number;
+      queued: number;
+      detail?: string | undefined;
+    };
 
 /**
  * Trim a headline to the protocol's byte cap.
@@ -49,7 +57,12 @@ export function truncateTitle(title: string, maxBytes = MAX_TITLE_BYTES): string
   // surrogate pair and emit a lone half, which is invalid UTF-8. Headlines do
   // contain emoji and astral-plane characters.
   const chars = Array.from(title);
-  let end = chars.length;
+  // Start at `budget` rather than the full length: every code point encodes to
+  // at least one UTF-8 byte, so no prefix longer than `budget` characters can
+  // fit in `budget` bytes. Without this the loop re-encodes the whole prefix on
+  // every step and is quadratic — 50k chars took 11.8 s, which a local model
+  // stuck in a repetition loop reaches easily. (Audit 2026-08-26, M18.)
+  let end = Math.min(chars.length, budget);
   while (end > 0 && encoder.encode(chars.slice(0, end).join('')).length > budget) {
     end--;
   }
@@ -79,11 +92,31 @@ function withAttribution(content: string, candidate: Candidate, config: Config):
 }
 
 /**
+ * How many consecutive compose failures to tolerate for one item before
+ * marking it seen and moving on.
+ *
+ * Bounded so a poisoned item cannot monopolise every run, but not 1, because
+ * this path also carries transient failures and giving up immediately would
+ * discard legitimate items on a blip.
+ */
+export const MAX_COMPOSE_FAILURES = 3;
+
+/** Outcome of composing one candidate. */
+export type ComposeOutcome =
+  | { status: 'ok'; post: ComposedPost }
+  | { status: 'refused'; category?: string | undefined; explanation?: string | undefined };
+
+/**
  * Compose a post from a candidate using the configured AI provider.
  *
- * Returns `null` when the model declined the item — expected periodically on a
- * general news feed, and handled by skipping rather than retrying, since a
- * retry would decline again.
+ * Returns a `refused` outcome — carrying the provider's category — when the
+ * model declined the item. Expected periodically on a general news feed, and
+ * handled by skipping rather than retrying, since a retry would decline again.
+ *
+ * This previously returned `null`, which discarded the category all three
+ * providers went to the trouble of extracting and made the documented
+ * `Model declined … (cyber)` message structurally impossible to produce.
+ * (Audit 2026-08-26, CODE-W9.)
  *
  * The attribution link is appended *after* composition rather than asked for in
  * the prompt: models reword URLs, and a subtly mangled source link is worse
@@ -94,11 +127,21 @@ export async function composeWithAi(
   config: Config,
   provider: AiProvider,
   template: string,
-): Promise<ComposedPost | null> {
+): Promise<ComposeOutcome> {
+  // Cap, then fence. Both untrusted fields go inside one fence with a
+  // per-call random marker; the publisher name is bot-side config or the
+  // feed's own <title>, so it stays outside. See fenceUntrusted for why.
+  const marker = newFenceMarker();
+  const item = [
+    `Headline: ${capText(candidate.title, config.ai.maxSourceTitleChars)}`,
+    '',
+    'Summary:',
+    capText(candidate.summary ?? '(no summary provided)', config.ai.maxSourceSummaryChars),
+  ].join('\n');
+
   const prompt = renderTemplate(template, {
-    TITLE: candidate.title,
-    SUMMARY: candidate.summary ?? '(no summary provided)',
-    PUBLISHER: candidate.publisher ?? 'unknown',
+    FENCED_ITEM: fenceUntrusted(item, marker),
+    PUBLISHER: capText(candidate.publisher ?? 'unknown', 200),
     MAX_TITLE_BYTES: MAX_TITLE_BYTES,
     TARGET_CONTENT_CHARS: config.ai.targetContentChars,
     MAX_TAGS: config.ai.maxTags,
@@ -111,20 +154,29 @@ export async function composeWithAi(
     maxTags: config.ai.maxTags,
   });
 
-  if (result.status === 'refused') return null;
+  if (result.status === 'refused') {
+    return {
+      status: 'refused',
+      ...(result.category !== undefined ? { category: result.category } : {}),
+      ...(result.explanation !== undefined ? { explanation: result.explanation } : {}),
+    };
+  }
 
   const content = withAttribution(result.content, candidate, config);
   return {
-    // The model is asked to respect the cap, but it is guidance to a model, not
-    // a guarantee — enforce it here where it is one.
-    title: truncateTitle(result.title),
-    content,
-    tags: buildTags({
-      required: requiredTags(config),
-      suggested: result.tags,
-      title: result.title,
-      content: result.content,
-    }),
+    status: 'ok',
+    post: {
+      // The model is asked to respect the cap, but it is guidance to a model,
+      // not a guarantee — enforce it here where it is one.
+      title: truncateTitle(result.title),
+      content,
+      tags: buildTags({
+        required: requiredTags(config),
+        suggested: result.tags,
+        title: result.title,
+        content: result.content,
+      }),
+    },
   };
 }
 
@@ -153,13 +205,19 @@ export async function runOnce(deps: PipelineDeps): Promise<RunOutcome> {
   const { config, sources, ledger, queue, publisher, provider, template } = deps;
   const now = deps.now ?? Date.now;
 
+  const runStartedAt = now();
+
   // 1. A queued post has already cost an AI call — publish it before composing
   //    anything new.
-  const queued = queue.next(now());
+  const queued = queue.next(runStartedAt);
   if (queued !== undefined) {
-    const result = await publisher.publish(queued.post);
+    const result = await publisher.publish(queued.post, runStartedAt);
     switch (result.status) {
       case 'dry-run':
+        // Drop it from the queue even in dry run: otherwise the same parked
+        // post is re-rendered on every tick and the operator never sees a new
+        // composition until it expires. (Audit 2026-08-26.)
+        queue.remove(queued.key);
         return { status: 'dry-run', post: queued.post };
       case 'published':
         queue.remove(queued.key);
@@ -171,9 +229,17 @@ export async function runOnce(deps: PipelineDeps): Promise<RunOutcome> {
           kind: queued.kind,
         });
         return { status: 'posted', title: queued.post.title, msgId: result.msgId, fromQueue: true };
+      case 'throttled-locally':
+        // NOT an attempt. This is the bot declining to publish yet, not a
+        // failure — counting it would drop a valid paid-for post after N
+        // ticks of a cadence the operator chose. (Audit 2026-08-26, M8.)
+        return deferred('local-budget', result.retryAfterMs, queue.size);
       case 'rate-limited':
         queue.recordAttempt(queued.key);
-        return { status: 'rate-limited', retryAfterMs: result.retryAfterMs, queued: queue.size };
+        return deferred('node-rate-limit', result.retryAfterMs, queue.size);
+      case 'transport-error':
+        queue.recordAttempt(queued.key);
+        return deferred('transport', result.retryAfterMs, queue.size, result.reason);
     }
   }
 
@@ -181,7 +247,11 @@ export async function runOnce(deps: PipelineDeps): Promise<RunOutcome> {
   const candidates: Candidate[] = [];
   for (const source of sources) {
     try {
-      candidates.push(...(await source.poll()));
+      const result = await source.poll();
+      // push() rather than push(...spread): spreading passes every item as an
+      // argument and throws RangeError on a pathologically large feed.
+      for (const c of result.candidates) candidates.push(c);
+      for (const w of result.warnings) console.warn(`  warning: ${w}`);
     } catch (err) {
       console.error(`  source "${source.name}" failed:`, err instanceof Error ? err.message : err);
     }
@@ -197,8 +267,34 @@ export async function runOnce(deps: PipelineDeps): Promise<RunOutcome> {
     return { status: 'nothing-new', polled: candidates.length };
   }
 
-  const post = await composeWithAi(fresh, config, provider, template);
-  if (post === null) {
+  let composed: ComposeOutcome;
+  try {
+    composed = await composeWithAi(fresh, config, provider, template);
+  } catch (err) {
+    // A compose failure must not abort the run and leave the item unrecorded:
+    // candidates are sorted newest-first, so `find` would return the same
+    // poisoned item on every tick, publishing nothing and billing an API call
+    // each time — indefinitely, since a future-dated item never ages out.
+    //
+    // But it must not be ledgered outright either. This path also carries
+    // transient failures (a flaky JSON parse, a rethrown 5xx), and the ledger
+    // has no un-record operation, so recording here would silently and
+    // permanently drop legitimate items. A bounded per-item failure count is
+    // the middle ground. (Audit 2026-08-26, M6.)
+    const reason = err instanceof Error ? err.message : String(err);
+    const failures = ledger.recordFailure(fresh.dedupKey, now());
+    console.error(
+      `  compose failed for "${fresh.title.slice(0, 60)}" ` +
+        `(attempt ${failures}/${MAX_COMPOSE_FAILURES}): ${reason}`,
+    );
+    if (failures >= MAX_COMPOSE_FAILURES) {
+      console.error('  giving up on this item and marking it seen.');
+      ledger.record({ key: fresh.dedupKey, title: fresh.title, postedAt: now(), kind: fresh.kind });
+    }
+    return { status: 'compose-failed', title: fresh.title, reason };
+  }
+
+  if (composed.status === 'refused') {
     // Record the refusal in the ledger so the bot doesn't re-compose (and
     // re-pay for) the same declined item on every subsequent run.
     ledger.record({
@@ -207,10 +303,22 @@ export async function runOnce(deps: PipelineDeps): Promise<RunOutcome> {
       postedAt: now(),
       kind: fresh.kind,
     });
-    return { status: 'refused', title: fresh.title };
+    return {
+      status: 'refused',
+      title: fresh.title,
+      ...(composed.category !== undefined ? { category: composed.category } : {}),
+    };
   }
+  const post = composed.post;
 
-  const result = await publisher.publish(post);
+  // Park the composed post rather than discarding it on any deferral:
+  // recomposing means a second AI call for output already paid for, and the
+  // source item may have scrolled out of the feed by the next run.
+  const park = (): void => {
+    queue.enqueue({ key: fresh.dedupKey, sourceTitle: fresh.title, kind: fresh.kind, post }, now());
+  };
+
+  const result = await publisher.publish(post, runStartedAt);
   switch (result.status) {
     case 'dry-run':
       // Deliberately not recorded. A dry run must be repeatable — recording it
@@ -228,16 +336,30 @@ export async function runOnce(deps: PipelineDeps): Promise<RunOutcome> {
       });
       return { status: 'posted', title: post.title, msgId: result.msgId, fromQueue: false };
 
+    case 'throttled-locally':
+      park();
+      return deferred('local-budget', result.retryAfterMs, queue.size);
+
     case 'rate-limited':
-      // Park the composed post rather than discarding it: recomposing would
-      // mean a second AI call for output already paid for, and the source item
-      // may have scrolled out of the feed by the next run.
-      queue.enqueue(
-        { key: fresh.dedupKey, sourceTitle: fresh.title, kind: fresh.kind, post },
-        now(),
-      );
-      return { status: 'rate-limited', retryAfterMs: result.retryAfterMs, queued: queue.size };
+      park();
+      return deferred('node-rate-limit', result.retryAfterMs, queue.size);
+
+    case 'transport-error':
+      // Previously this threw and escaped before the post could be queued,
+      // discarding output an AI call had already been paid for.
+      park();
+      return deferred('transport', result.retryAfterMs, queue.size, result.reason);
   }
+}
+
+/** Build a `deferred` outcome. */
+function deferred(
+  cause: 'local-budget' | 'node-rate-limit' | 'transport',
+  retryAfterMs: number,
+  queued: number,
+  detail?: string,
+): RunOutcome {
+  return { status: 'deferred', cause, retryAfterMs, queued, ...(detail !== undefined ? { detail } : {}) };
 }
 
 export { loadTemplate };

@@ -62,7 +62,12 @@ export function schedule(
         return;
       }
       running = true;
-      void task()
+      // Promise.resolve().then(task) rather than task(): a synchronous throw
+      // from task() would escape before .finally attached and leave `running`
+      // stuck true forever — a silent permanent stop. Latent today (the caller
+      // is async) but a whole class of bug removed for free.
+      void Promise.resolve()
+        .then(task)
         .catch((err: unknown) => {
           console.error('  scheduled run failed:', err instanceof Error ? err.message : err);
         })

@@ -9,7 +9,13 @@ node:
   # node — rate limits are enforced at the ingress node only.
   url: https://darkw0rld.mine.nu
 
-  # Must match the node's network, or every signature is rejected.
+  # Which network you intend to publish to. Checked against the node's health
+  # endpoint at startup; a mismatch aborts before anything is signed.
+  #
+  # This is an intent declaration, not a binding: signatures adopt whatever
+  # network the NODE reports, so without that startup check a wrong value here
+  # would silently publish to the other chain rather than being rejected.
+  # Testnet and mainnet share wallet keys, so that would be irreversible.
   network: testnet
 
   # Request timeout in milliseconds.
@@ -89,6 +95,7 @@ ai:
   #   openai-compatible whatever your server serves
   model: claude-opus-5
 
+  # Uses OPENAI_COMPATIBLE_API_KEY, not OPENAI_API_KEY — see .env.example.
   # Required ONLY for provider: openai-compatible. This is what makes local
   # models work — the bot refuses to start without it on that provider.
   #   Ollama     http://localhost:11434/v1

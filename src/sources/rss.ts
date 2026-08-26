@@ -48,6 +48,14 @@ const parser = new XMLParser({
   trimValues: true,
 });
 
+/**
+ * Tolerance for feed items dated slightly in the future.
+ *
+ * Publisher clocks drift and timezone handling is often wrong, so a few
+ * minutes ahead is normal and should not drop a legitimate item.
+ */
+const FUTURE_SKEW_MS = 10 * 60_000;
+
 /** Coerce a value that may be a single item or an array into an array. */
 function asArray<T>(value: T | T[] | undefined): T[] {
   if (value === undefined) return [];
@@ -72,18 +80,31 @@ function asText(value: unknown): string | undefined {
  * text to an AI provider and may quote it, so tags are removed rather than
  * rendered — this is a text pipeline, and un-stripped markup shows up as
  * literal `<p>` in composed posts.
+ *
+ * **Every character class here excludes `<` as well as `>`, and that is load
+ * bearing.** With `[^>]` a run of unmatched `<` makes the engine scan to
+ * end-of-string and backtrack from every position — quadratic, and reachable
+ * from any feed body. Measured on 400 KB of bare `<`: 92,841 ms with `[^>]`,
+ * 0.5 ms with `[^<>]`, byte-identical output on real markup. A tag can never
+ * legally contain `<`, so excluding it costs nothing and bounds the scan.
+ * (Audit 2026-08-26, M2.)
  */
 export function stripHtml(html: string): string {
   return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
+    .replace(/<script\b[^<>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^<>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^<>]+>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>')
     .replace(/&quot;/gi, '"')
     .replace(/&#39;|&apos;/gi, "'")
+    // Second tag-strip pass, because the decodes above can *reveal* markup:
+    // `&lt;img onerror=…&gt;` survives the first pass as text and only becomes
+    // `<img onerror=…>` here. One extra linear pass closes that, and the
+    // bounded character class keeps it cheap. (Audit 2026-08-26, SEC-N2.)
+    .replace(/<[^<>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -213,7 +234,8 @@ export class RssSource implements Source {
   async pollDetailed(): Promise<PollResult> {
     const warnings: string[] = [];
     const candidates: Candidate[] = [];
-    const cutoff = this.#maxAgeMs > 0 ? Date.now() - this.#maxAgeMs : 0;
+    const now = Date.now();
+    const cutoff = this.#maxAgeMs > 0 ? now - this.#maxAgeMs : 0;
 
     const results = await Promise.allSettled(
       this.#feeds.map(async (feed) => {
@@ -236,6 +258,19 @@ export class RssSource implements Source {
         continue;
       }
       for (const item of result.value.items) {
+        // Drop future-dated items. Candidates are sorted newest-first and the
+        // pipeline takes the first unseen one, so a <pubDate> in 2099 wins
+        // selection on EVERY run — a hostile item pins itself at the top
+        // forever, starving every legitimate publisher, and (because maxAgeDays
+        // only drops items that are too OLD) it never ages out either. Also
+        // fires accidentally on any feed with clock skew or a timezone bug.
+        // (Audit 2026-08-26, chain A/B.)
+        if (item.publishedAt !== undefined && item.publishedAt > now + FUTURE_SKEW_MS) {
+          warnings.push(
+            `feed ${feed.url}: dropped future-dated item "${item.title.slice(0, 60)}"`,
+          );
+          continue;
+        }
         // An item with no date is kept: plenty of feeds omit dates, and
         // dropping them would silently ignore whole publishers.
         if (cutoff > 0 && item.publishedAt !== undefined && item.publishedAt < cutoff) continue;
@@ -248,7 +283,7 @@ export class RssSource implements Source {
     return { candidates, warnings };
   }
 
-  async poll(): Promise<Candidate[]> {
-    return (await this.pollDetailed()).candidates;
+  async poll(): Promise<PollResult> {
+    return this.pollDetailed();
   }
 }

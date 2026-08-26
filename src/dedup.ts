@@ -112,7 +112,14 @@ export function candidateKey(item: { guid?: string; url?: string; title: string 
   // Join the token list back into a string: normalization already dropped
   // punctuation, casing and stopwords, so this keys on the headline's
   // significant words rather than its exact rendering.
-  return hashKey(normalizeTitle(item.title).join(' '));
+  //
+  // Fall back to the raw title when normalization yields nothing. It strips to
+  // [a-z0-9], so ANY Cyrillic or CJK headline tokenises to [] — every item on
+  // such a feed would otherwise share one key, and only the first would ever
+  // be posted. Ogmara ships UI in 7 languages including Russian, so this is an
+  // ordinary user, not an edge case. (Audit 2026-08-26, M13.)
+  const tokens = normalizeTitle(item.title);
+  return hashKey(tokens.length > 0 ? tokens.join(' ') : item.title.trim().toLowerCase());
 }
 
 /** Words carrying no distinguishing signal when comparing headlines. */
@@ -142,14 +149,28 @@ export function normalizeTitle(title: string): string[] {
  * character-level distance does not.
  */
 export function titleSimilarity(a: string, b: string): number {
-  const setA = new Set(normalizeTitle(a));
-  const setB = new Set(normalizeTitle(b));
+  // Same fallback as candidateKey: without it, similarity is a permanent no-op
+  // for non-Latin feeds, silently disabling the "same story, different outlet"
+  // protection the README advertises by name. Character bigrams work for
+  // scripts that do not use spaces. (Audit 2026-08-26, M13.)
+  const setA = new Set(tokensOrBigrams(a));
+  const setB = new Set(tokensOrBigrams(b));
   if (setA.size === 0 || setB.size === 0) return 0;
 
   let intersection = 0;
   for (const token of setA) if (setB.has(token)) intersection++;
   const union = setA.size + setB.size - intersection;
   return union === 0 ? 0 : intersection / union;
+}
+
+/** Significant-word tokens, or character bigrams for scripts they cannot handle. */
+function tokensOrBigrams(title: string): string[] {
+  const tokens = normalizeTitle(title);
+  if (tokens.length > 0) return tokens;
+  const chars = [...title.trim().toLowerCase().replace(/\s+/g, '')];
+  const bigrams: string[] = [];
+  for (let i = 0; i + 1 < chars.length; i++) bigrams.push(chars[i]! + chars[i + 1]!);
+  return bigrams;
 }
 
 /**

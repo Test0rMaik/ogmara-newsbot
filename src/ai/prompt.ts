@@ -12,8 +12,51 @@
  * by files the operator edits, for no real gain.
  */
 
+import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { ConfigError } from '../config.js';
+
+/**
+ * Wrap untrusted text in a fence the model is told to treat as data.
+ *
+ * Feed titles and summaries are authored by whoever can post to the feed —
+ * which for an aggregator (a subreddit's `.rss`, a Google News query feed, a
+ * link-aggregator feed) is any internet user. Splicing that text straight into
+ * the prompt lets it read as instructions, and the resulting post is signed
+ * with the operator's wallet and gossiped to a mesh where it cannot be
+ * unpublished. Structured output constrains the *shape* of the reply, not its
+ * content, so it is no defence here.
+ *
+ * The delimiter is random per call and stripped from the payload, so the text
+ * cannot close its own fence and resume as instructions — a fixed marker
+ * would be guessable from the public source of this repo. This raises the cost
+ * of an injection considerably; combined with capping the fields and putting
+ * the rules *after* the data, it is the practical mitigation. It is not a
+ * proof, which is why dry-run review and the disclosure tag still matter.
+ *
+ * (Audit 2026-08-26, M1.)
+ */
+export function fenceUntrusted(text: string, marker: string): string {
+  // Strip the bare keyword outright rather than only its `KEYWORD_suffix`
+  // form: the closing delimiter is `MARKER_UNTRUSTED_SOURCE>>>`, where the
+  // keyword is a *suffix*, so a pattern anchored on a trailing underscore
+  // misses it entirely and leaves a forgeable fence in the payload. Removing
+  // every occurrence of the keyword — and of the marker — means no arrangement
+  // of feed text can close the fence and resume as instructions.
+  const escaped = text.replaceAll(marker, '').replaceAll('UNTRUSTED_SOURCE', '');
+  return `<<<UNTRUSTED_SOURCE_${marker}\n${escaped}\n${marker}_UNTRUSTED_SOURCE>>>`;
+}
+
+/** Generate a per-call fence marker. Random so feed text cannot predict it. */
+export function newFenceMarker(): string {
+  return randomBytes(9).toString('base64url').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+/** Truncate to a character budget, marking the cut so the model knows. */
+export function capText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}… [truncated]`;
+}
 
 /** Values available to a template. */
 export type PromptVars = Readonly<Record<string, string | number>>;

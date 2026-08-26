@@ -30,16 +30,29 @@ import { isValidCron } from './scheduler.js';
  */
 export const DEFAULT_NODE_NEWS_LIMIT_PER_HOUR = 5;
 
-/** Protocol caps on a news post payload (spec §3.5). */
+/**
+ * Protocol caps on a news post payload (spec §3.5).
+ *
+ * Both are BYTES. The spec prose says "chars" at §3.5 but §3.7 and the node's
+ * own validator use byte length, and the node is authoritative.
+ */
 export const MAX_TITLE_BYTES = 256;
-export const MAX_CONTENT_CHARS = 65536;
+export const MAX_CONTENT_BYTES = 65536;
 
 const contentRating = z.enum(['general', 'teen', 'mature', 'explicit']);
 
 const nodeSchema = z.object({
   /** Base URL of the Ogmara L2 node to post through. */
   url: z.url({ protocol: /^https?$/ }),
-  /** Must match the node's network or every signature is rejected. */
+  /**
+   * Which network you intend to publish to.
+   *
+   * Checked against the node's `/api/v1/health` at startup; a mismatch aborts.
+   * Note this is an *intent* declaration, not a binding: the SDK makes every
+   * signature adopt whatever network the node reports, so without the startup
+   * check a wrong value here would silently publish to the other chain rather
+   * than being rejected. (Audit 2026-08-26, M3.)
+   */
   network: z.enum(['testnet', 'mainnet']).default('testnet'),
   /** Request timeout in milliseconds. */
   timeoutMs: z.int().min(1000).max(300_000).default(30_000),
@@ -136,6 +149,18 @@ const aiSchema = z
     promptPath: z.string().min(1).default('prompts/news.md'),
     /** Rough body-length target handed to the model as guidance. */
     targetContentChars: z.int().min(100).max(10_000).default(600),
+    /**
+     * Hard caps on the untrusted feed fields before they enter the prompt.
+     *
+     * Feed `title`/`summary` are attacker-influenceable and were previously
+     * unbounded up to the 5 MB feed cap. That is three problems at once: a
+     * ~600 KB summary is ~150k tokens (~$2.25 per call, hourly, forever); an
+     * oversized prompt returns a provider 400 that stalls the pipeline; and an
+     * unbounded field can bury the prompt's own instructions. Real summaries
+     * are a few hundred characters. (Audit 2026-08-26, M5.)
+     */
+    maxSourceTitleChars: z.int().min(50).max(2_000).default(500),
+    maxSourceSummaryChars: z.int().min(100).max(50_000).default(4_000),
     /** How many tags to request. The protocol caps the final list at 10. */
     maxTags: z.int().min(1).max(10).default(5),
   })
@@ -192,6 +217,16 @@ export interface Secrets {
   anthropicApiKey?: string | undefined;
   openaiApiKey?: string | undefined;
   geminiApiKey?: string | undefined;
+  /**
+   * Key for `openai-compatible` endpoints, kept separate from the real
+   * OpenAI credential.
+   *
+   * Reusing OPENAI_API_KEY meant an operator who had used OpenAI and then
+   * switched to a third-party endpoint — OpenRouter is recommended in our own
+   * docs — silently shipped a live credential to that operator on every
+   * request. (Audit 2026-08-26, M10.)
+   */
+  openaiCompatibleApiKey?: string | undefined;
 }
 
 /** Raised when config or secrets are invalid. Message is operator-facing. */
@@ -260,5 +295,6 @@ export function loadSecrets(env: NodeJS.ProcessEnv = process.env): Secrets {
     anthropicApiKey: env['ANTHROPIC_API_KEY']?.trim(),
     openaiApiKey: env['OPENAI_API_KEY']?.trim(),
     geminiApiKey: env['GEMINI_API_KEY']?.trim(),
+    openaiCompatibleApiKey: env['OPENAI_COMPATIBLE_API_KEY']?.trim(),
   };
 }

@@ -33,6 +33,30 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 const DEFAULT_USER_AGENT = 'ogmara-newsbot (+https://github.com/Test0rMaik/ogmara-newsbot)';
 
+/** Maximum redirect hops before giving up. */
+const MAX_REDIRECTS = 5;
+
+/**
+ * Host patterns a feed must never resolve to.
+ *
+ * Literal-address check only: this deliberately does not do a DNS lookup, so
+ * it stops the obvious `302 -> http://127.0.0.1/` pivot without pretending to
+ * be full SSRF protection (which would need resolve-then-pin to defeat DNS
+ * rebinding). Feeds are operator-configured, so the realistic threat is a
+ * hostile publisher redirecting, not an arbitrary attacker.
+ */
+const BLOCKED_HOST_PATTERNS: readonly RegExp[] = [
+  /^localhost$/i,
+  /^127\./,
+  /^0\.0\.0\.0$/,
+  /^10\./,
+  /^192\.168\./,
+  /^172\.(1[6-9]|2\d|3[01])\./,
+  /^169\.254\./,
+  /^\[?::1\]?$/,
+  /^\[?f[cd][0-9a-f]{2}:/i,
+];
+
 /**
  * Assert a URL is safe to fetch.
  *
@@ -49,6 +73,9 @@ export function assertFetchableUrl(url: string): URL {
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new FetchError(`unsupported protocol "${parsed.protocol}" (only http/https)`, url);
+  }
+  if (BLOCKED_HOST_PATTERNS.some((re) => re.test(parsed.hostname))) {
+    throw new FetchError(`refusing to fetch a loopback or private address (${parsed.hostname})`, url);
   }
   return parsed;
 }
@@ -75,14 +102,35 @@ export async function fetchText(url: string, options: FetchOptions = {}): Promis
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const resp = await fetch(url, {
-      signal: controller.signal,
-      redirect: 'follow',
-      headers: {
-        accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
-        'user-agent': userAgent,
-      },
-    });
+    // Redirects are followed manually so every hop is re-validated. With
+    // `redirect: 'follow'` only the initial URL is checked, and a hostile or
+    // MITM'd feed can bounce the request to a loopback or RFC1918 address —
+    // a blind SSRF probe of the operator's LAN from a long-lived unattended
+    // process. (Audit 2026-08-26, M15.)
+    let current = url;
+    let resp: Response;
+    for (let hop = 0; ; hop++) {
+      assertFetchableUrl(current);
+      resp = await fetch(current, {
+        signal: controller.signal,
+        redirect: 'manual',
+        headers: {
+          accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
+          'user-agent': userAgent,
+        },
+      });
+
+      if (resp.status < 300 || resp.status >= 400) break;
+
+      const location = resp.headers.get('location');
+      if (location === null) break;
+      if (hop >= MAX_REDIRECTS) {
+        throw new FetchError(`exceeded ${MAX_REDIRECTS} redirects`, url);
+      }
+      // Drain the redirect body so the socket is released promptly.
+      await resp.body?.cancel().catch(() => undefined);
+      current = new URL(location, current).toString();
+    }
 
     if (!resp.ok) {
       throw new FetchError(`HTTP ${resp.status} ${resp.statusText}`, url);

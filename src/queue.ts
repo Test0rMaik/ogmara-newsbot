@@ -57,6 +57,25 @@ export const DEFAULT_MAX_ATTEMPTS = 5;
  */
 export const DEFAULT_MAX_AGE_HOURS = 24;
 
+/** Structural check for a queue entry deserialized from disk. */
+function isQueuedPost(value: unknown): value is QueuedPost {
+  if (value === null || typeof value !== 'object') return false;
+  const e = value as Record<string, unknown>;
+  const post = e['post'] as Record<string, unknown> | undefined;
+  return (
+    typeof e['key'] === 'string' &&
+    typeof e['sourceTitle'] === 'string' &&
+    typeof e['kind'] === 'string' &&
+    typeof e['queuedAt'] === 'number' &&
+    typeof e['attempts'] === 'number' &&
+    post !== undefined &&
+    post !== null &&
+    typeof post['title'] === 'string' &&
+    typeof post['content'] === 'string' &&
+    Array.isArray(post['tags'])
+  );
+}
+
 /** FIFO queue of composed posts waiting to be published. */
 export class PostQueue {
   readonly #path: string;
@@ -97,7 +116,21 @@ export class PostQueue {
     try {
       const parsed = JSON.parse(raw) as QueueFile;
       if (!Array.isArray(parsed.pending)) throw new Error('no pending array');
-      return new PostQueue(path, parsed.pending, maxAttempts, maxAgeHours);
+      // The version field was written on every save and never read. A future
+      // schema change replaying an old queue.json straight into publish() is
+      // the hazard this closes. (Audit 2026-08-26, M17.)
+      if (parsed.version !== 1) throw new Error(`unsupported version ${String(parsed.version)}`);
+      // Shape-check each entry: the file is advertised as operator-editable,
+      // and an entry missing `post` would previously reach publish(undefined)
+      // and TypeError on the FIRST thing every run does — crashing every run
+      // for up to maxAgeHours. Bad entries are dropped, not fatal.
+      const valid = parsed.pending.filter(isQueuedPost);
+      if (valid.length !== parsed.pending.length) {
+        console.warn(
+          `Warning: dropped ${parsed.pending.length - valid.length} malformed queue entr(ies) from "${path}".`,
+        );
+      }
+      return new PostQueue(path, valid, maxAttempts, maxAgeHours);
     } catch (err) {
       console.warn(
         `Warning: queue at "${path}" is unreadable (${err instanceof Error ? err.message : String(err)}); ` +

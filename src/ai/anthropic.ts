@@ -89,6 +89,16 @@ export class AnthropicProvider implements AiProvider {
       };
     }
 
+    if (response.stop_reason === 'max_tokens') {
+      // Named explicitly, as the OpenAI and Gemini providers do. Without this
+      // a truncated reply surfaced as "returned text that is not valid JSON"
+      // with a comment blaming a lost output_config — actively misleading.
+      throw new AiResponseError(
+        `Claude hit the ${this.#maxTokens}-token cap before finishing — raise ai.maxTokens ` +
+          '(thinking tokens draw on the same budget, so lower ai.effort also helps)',
+      );
+    }
+
     const text = response.content.find(
       (block): block is Anthropic.Beta.BetaTextBlock => block.type === 'text',
     );

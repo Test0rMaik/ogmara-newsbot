@@ -123,3 +123,28 @@ describe('isNearDuplicate', () => {
     expect(isNearDuplicate('Anything', [])).toBe(false);
   });
 });
+
+describe('non-Latin scripts (audit M13)', () => {
+  it('gives distinct keys to distinct Cyrillic headlines', () => {
+    // normalizeTitle strips to [a-z0-9], so these tokenise to [] — every item
+    // on a Russian feed previously shared one key and only the first ever
+    // published.
+    const a = candidateKey({ title: 'Центробанк сохранил ставку' });
+    const b = candidateKey({ title: 'Извержение вулкана в Исландии' });
+    expect(a).not.toBe(b);
+  });
+
+  it('gives distinct keys to distinct CJK headlines', () => {
+    expect(candidateKey({ title: '中央銀行が金利を据え置き' })).not.toBe(
+      candidateKey({ title: 'アイスランドで火山が噴火' }),
+    );
+  });
+
+  it('still detects near-duplicates in non-Latin scripts', () => {
+    // The "same story, different outlet" protection must not be a silent
+    // no-op for these feeds.
+    const seen = ['Центробанк сохранил ключевую ставку без изменений'];
+    expect(isNearDuplicate('Центробанк сохранил ключевую ставку', seen)).toBe(true);
+    expect(isNearDuplicate('Извержение вулкана в Исландии', seen)).toBe(false);
+  });
+});
