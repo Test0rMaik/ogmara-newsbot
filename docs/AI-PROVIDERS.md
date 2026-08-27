@@ -58,10 +58,16 @@ Get a key at [platform.openai.com](https://platform.openai.com/api-keys).
 ```yaml
 ai:
   provider: gemini
-  model: gemini-3-pro
+  model: gemini-3.7-flash
 ```
 
 Get a key at [aistudio.google.com](https://aistudio.google.com/apikey).
+
+Google's model names churn faster than this doc — check
+[ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models)
+for the current list rather than trusting this example to stay accurate.
+`gemini-3.7-flash` is the current flagship general-purpose model; `gemini-2.5-pro`
+is a stable "pro"-tier alternative if you specifically want that tier over Flash.
 
 ## Local and OpenAI-compatible servers
 

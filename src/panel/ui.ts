@@ -49,20 +49,45 @@ export function renderPage(ctx: PageContext): string {
   input { background: #12141a; color: #e6e6e6; border: 1px solid #2a2e38; border-radius: 6px;
           padding: 0.4rem; width: 100%; box-sizing: border-box; }
   label { display: block; margin: 0.6rem 0 0.2rem; font-size: 0.85rem; color: #b8bcc4; }
-  #error { color: #ff8a8a; white-space: pre-wrap; }
+  #error { white-space: pre-wrap; }
+  .error { color: #ff8a8a; }
+  .success { color: #7fd88f; }
   #status dt { color: #9aa0a8; font-size: 0.85rem; }
   #status dd { margin: 0 0 0.5rem; font-size: 1rem; }
   code { background: #12141a; padding: 0.1rem 0.3rem; border-radius: 4px; }
+
+  .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+  .tabs { display: flex; gap: 0.5rem; border-bottom: 1px solid #2a2e38; margin-bottom: 1rem; }
+  .tab-btn { background: none; color: #9aa0a8; border: none; border-bottom: 2px solid transparent;
+             border-radius: 0; padding: 0.5rem 0.25rem; margin-bottom: -1px; }
+  .tab-btn.active { color: #e6e6e6; border-bottom-color: #3a6ff7; }
+  .tab-btn:hover:not(.active) { color: #c8ccd2; }
+
+  .quick-stats { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 0 0 1.2rem; }
+  .quick-stats div { min-width: 6rem; }
+  .quick-stats dt { color: #9aa0a8; font-size: 0.8rem; }
+  .quick-stats dd { margin: 0; font-size: 1.3rem; }
+
+  .post-row { border-bottom: 1px solid #2a2e38; padding: 0.6rem 0; }
+  .post-row:last-child { border-bottom: none; }
+  .post-title { font-size: 0.95rem; }
+  .post-meta { color: #9aa0a8; font-size: 0.8rem; margin-top: 0.2rem; }
+  .post-meta span { margin-right: 1rem; }
+
+  .hashtag-list { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0; margin: 0; list-style: none; }
+  .hashtag-list li { background: #12141a; border: 1px solid #2a2e38; border-radius: 999px;
+                      padding: 0.2rem 0.7rem; font-size: 0.85rem; }
 </style>
 </head>
 <body>
   <h1>Ogmara Newsbot</h1>
   <p class="muted">Bot wallet: <code>${bot}</code> — ${network}</p>
 
+  <p id="error"></p>
+
   <div id="login-card" class="card">
     <p>Sign in with the wallet authorised to operate this bot.</p>
     <button id="login-btn">Connect wallet</button>
-    <p id="error"></p>
   </div>
 
   <div id="backup-banner" class="banner" hidden>
@@ -74,20 +99,44 @@ export function renderPage(ctx: PageContext): string {
   </div>
 
   <div id="panel" class="card" hidden>
-    <p class="muted">Signed in as <code id="whoami"></code></p>
-    <dl id="status"></dl>
-    <button id="logout-btn">Log out</button>
+    <div class="panel-header">
+      <p class="muted">Signed in as <code id="whoami"></code></p>
+      <button id="logout-btn">Log out</button>
+    </div>
 
-    <hr>
-    <h2>Display name</h2>
-    <label for="display-name">Display name</label>
-    <input id="display-name" maxlength="64">
-    <p><button id="profile-btn">Update profile</button></p>
+    <nav class="tabs">
+      <button class="tab-btn active" id="tab-btn-dashboard" data-tab="dashboard">Dashboard</button>
+      <button class="tab-btn" id="tab-btn-settings" data-tab="settings">Settings</button>
+    </nav>
 
-    <hr>
-    <h2>Wallet registration</h2>
-    <p class="muted">Registering on-chain raises the daily posting ceiling. Costs real KLV, non-refundable.</p>
-    <button id="register-btn" class="danger">Register wallet</button>
+    <div id="tab-dashboard" class="tab-content">
+      <p id="dashboard-error" class="error"></p>
+      <dl class="quick-stats" id="quick-stats"></dl>
+
+      <h2>Recent posts</h2>
+      <p class="muted" id="posts-empty" hidden>No posts yet.</p>
+      <div id="posts-list"></div>
+
+      <h2>Hashtags</h2>
+      <p class="muted" id="hashtags-empty" hidden>No hashtags yet.</p>
+      <p class="muted" id="hashtags-note">Counted across the posts shown above, not your full history.</p>
+      <ul class="hashtag-list" id="hashtag-list"></ul>
+    </div>
+
+    <div id="tab-settings" class="tab-content" hidden>
+      <dl id="status"></dl>
+
+      <hr>
+      <h2>Display name</h2>
+      <label for="display-name">Display name</label>
+      <input id="display-name" maxlength="64">
+      <p><button id="profile-btn">Update profile</button></p>
+
+      <hr>
+      <h2>Wallet registration</h2>
+      <p class="muted">Registering on-chain raises the daily posting ceiling. Costs real KLV, non-refundable.</p>
+      <button id="register-btn" class="danger">Register wallet</button>
+    </div>
   </div>
 
   <script src="/app.js"></script>
@@ -110,9 +159,16 @@ const errorEl = document.getElementById('error');
 const loginCard = document.getElementById('login-card');
 const panel = document.getElementById('panel');
 const backupBanner = document.getElementById('backup-banner');
+const dashboardErrorEl = document.getElementById('dashboard-error');
 
 function showError(message) {
   errorEl.textContent = message;
+  errorEl.className = message ? 'error' : '';
+}
+
+function showSuccess(message) {
+  errorEl.textContent = message;
+  errorEl.className = 'success';
 }
 
 async function api(path, options) {
@@ -157,10 +213,19 @@ async function login() {
       method: 'POST',
       body: JSON.stringify({ address, nonce: challenge.nonce, signature }),
     });
-    await refresh();
   } catch (err) {
     showError(err.message || String(err));
+    return;
   }
+  // Login itself succeeded at this point. status and posts are refreshed
+  // independently from here rather than chained — /api/posts has no
+  // dependency on whatever /api/status might fail on (most likely the chain
+  // being unreachable), so one failing must not silently prevent the other
+  // from ever being tried.
+  await refresh().catch((err) => {
+    if (err && err.status !== 401) showError(err.message || String(err));
+  });
+  await refreshPosts();
 }
 
 async function logout() {
@@ -168,6 +233,7 @@ async function logout() {
   loginCard.hidden = false;
   panel.hidden = true;
   backupBanner.hidden = true;
+  showError('');
 }
 
 function setField(dl, label, value) {
@@ -177,6 +243,114 @@ function setField(dl, label, value) {
   dd.textContent = value;
   dl.appendChild(dt);
   dl.appendChild(dd);
+}
+
+function switchTab(name) {
+  for (const btn of document.querySelectorAll('.tab-btn')) {
+    btn.classList.toggle('active', btn.dataset.tab === name);
+  }
+  for (const content of document.querySelectorAll('.tab-content')) {
+    content.hidden = content.id !== 'tab-' + name;
+  }
+  // Otherwise the dashboard only ever reflects whatever was true at page
+  // load — "Queued" in particular is the one genuinely live number here
+  // (the retry queue actually drains over time), so leaving it frozen is
+  // exactly the "looks like nothing is happening" failure mode this panel
+  // already had once this session.
+  if (name === 'dashboard') refreshPosts();
+}
+
+/**
+ * "3 minutes ago" / "5 hours ago" / "2 days ago", falling back to a plain
+ * date once it's old enough that a relative count stops being useful at a
+ * glance. This is the actual point of the stat: noticing at a glance that
+ * the bot has gone quiet, not precise timekeeping.
+ */
+function formatRelativeTime(ms) {
+  const diff = Date.now() - ms;
+  const minutes = Math.floor(diff / 60000);
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return minutes + ' minute' + (minutes === 1 ? '' : 's') + ' ago';
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + ' hour' + (hours === 1 ? '' : 's') + ' ago';
+  const days = Math.floor(hours / 24);
+  if (days < 30) return days + ' day' + (days === 1 ? '' : 's') + ' ago';
+  return new Date(ms).toLocaleDateString();
+}
+
+function setQuickStat(dl, label, value) {
+  const wrap = document.createElement('div');
+  const dt = document.createElement('dt');
+  dt.textContent = label;
+  const dd = document.createElement('dd');
+  dd.textContent = value;
+  wrap.appendChild(dt);
+  wrap.appendChild(dd);
+  dl.appendChild(wrap);
+}
+
+function renderPost(post) {
+  const row = document.createElement('div');
+  row.className = 'post-row';
+
+  const title = document.createElement('div');
+  title.className = 'post-title';
+  title.textContent = post.title;
+  row.appendChild(title);
+
+  const meta = document.createElement('div');
+  meta.className = 'post-meta';
+  const parts = [
+    formatRelativeTime(post.timestamp),
+    'reactions: ' + post.reactionCount,
+    'reposts: ' + post.repostCount,
+    'comments: ' + post.commentCount,
+  ];
+  for (const part of parts) {
+    const span = document.createElement('span');
+    span.textContent = part;
+    meta.appendChild(span);
+  }
+  row.appendChild(meta);
+
+  return row;
+}
+
+async function refreshPosts() {
+  dashboardErrorEl.textContent = '';
+  try {
+    const stats = await api('/api/posts', { method: 'GET' });
+
+    const quickStats = document.getElementById('quick-stats');
+    quickStats.textContent = '';
+    setQuickStat(quickStats, 'Published', String(stats.totalPublished));
+    setQuickStat(quickStats, 'Queued', String(stats.queuedCount));
+    setQuickStat(
+      quickStats,
+      'Last post',
+      stats.lastPostedAt ? formatRelativeTime(stats.lastPostedAt) : 'never',
+    );
+
+    const postsList = document.getElementById('posts-list');
+    postsList.textContent = '';
+    document.getElementById('posts-empty').hidden = stats.posts.length > 0;
+    for (const post of stats.posts) {
+      postsList.appendChild(renderPost(post));
+    }
+
+    const hashtagList = document.getElementById('hashtag-list');
+    hashtagList.textContent = '';
+    const tags = Object.entries(stats.hashtagCounts).sort((a, b) => b[1] - a[1]);
+    document.getElementById('hashtags-empty').hidden = tags.length > 0;
+    document.getElementById('hashtags-note').hidden = tags.length === 0;
+    for (const [tag, count] of tags) {
+      const li = document.createElement('li');
+      li.textContent = '#' + tag + ' (' + count + ')';
+      hashtagList.appendChild(li);
+    }
+  } catch (err) {
+    dashboardErrorEl.textContent = err.message || String(err);
+  }
 }
 
 async function refresh() {
@@ -229,10 +403,17 @@ async function updateProfile() {
   showError('');
   try {
     const displayName = document.getElementById('display-name').value.trim();
-    await api('/api/profile', {
+    if (!displayName) {
+      showError('Enter a display name first.');
+      return;
+    }
+    const result = await api('/api/profile', {
       method: 'POST',
-      body: JSON.stringify({ displayName: displayName || undefined }),
+      body: JSON.stringify({ displayName }),
     });
+    showSuccess(
+      result.status === 'updated' ? 'Profile updated.' : 'Nothing to update.',
+    );
   } catch (err) {
     showError(err.message || String(err));
   }
@@ -252,7 +433,11 @@ async function register() {
   try {
     const result = await api('/api/register', { method: 'POST', body: JSON.stringify({ confirm: true }) });
     if (result.status === 'registered') {
-      showError('Registered. Transaction: ' + result.txHash);
+      showSuccess('Registered. Transaction: ' + result.txHash);
+    } else if (result.status === 'already-registered') {
+      showSuccess('Already registered — nothing was spent.');
+    } else if (result.status === 'insufficient-funds') {
+      showError('Insufficient balance: need ' + result.requiredKlv + ' KLV, have ' + result.balanceKlv + '.');
     }
     await refresh();
   } catch (err) {
@@ -278,15 +463,24 @@ document.getElementById('logout-btn').addEventListener('click', logout);
 document.getElementById('profile-btn').addEventListener('click', updateProfile);
 document.getElementById('register-btn').addEventListener('click', register);
 document.getElementById('backup-ack-btn').addEventListener('click', ackBackup);
+for (const btn of document.querySelectorAll('.tab-btn')) {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+}
 
 // If a session cookie is already valid (page reload, or localhost bypass),
 // the status call succeeds immediately and skips the login screen. A 401
 // just means "not logged in yet" and stays silent; anything else (the chain
 // being unreachable, a server error) is worth surfacing rather than leaving
 // the operator looking at an unexplained login screen.
+//
+// Run independently rather than chained: /api/posts has no dependency on
+// whatever /api/status might fail on, so a status failure (most likely the
+// chain being unreachable) must not silently prevent the post list from
+// ever loading.
 refresh().catch((err) => {
   if (err && err.status !== 401) showError(err.message || String(err));
 });
+refreshPosts();
 `;
 }
 

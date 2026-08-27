@@ -5,6 +5,106 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-08-27
+
+A dashboard tab for the control panel, and three fixes for things reported
+against 0.9.0.
+
+### Added
+
+- **Dashboard tab**, now the panel's default view — what used to be the only
+  view (display name, wallet registration) moved to a new "Settings" tab.
+  Shows:
+  - The last 25 posts, each with its reaction/repost/comment counts —
+    `GET /api/v1/users/:address/posts` already returns this enrichment
+    server-side, so this needed no new node-side work, only decoding the
+    response correctly (see Fixed, below).
+  - Total posts published (the node's own lifetime count, not limited to the
+    25 shown) and how many are currently sitting in the local retry queue —
+    "how many succeeded" turned out to be better framed as
+    published-vs-queued than published-vs-failed, since a composition
+    failure never reaches the node at all, so every post the node knows about
+    is by definition a success.
+  - Hashtag usage, tallied across the fetched posts and sorted by count.
+  - **Last published, as a relative time** ("3 hours ago") — the one stat
+    added beyond what was asked for. The actual operational risk for an
+    unattended bot isn't "how many posts", it's "did it silently stop
+    posting three days ago and nobody noticed" — this is the fastest way to
+    see that at a glance.
+- `--init`'s startup now warns when a source's `schedule:` can fire more
+  often than `posting.maxPostsPerHour` allows, computed for real per cron
+  expression (`scheduler.ts`'s new `runsPerHour`) rather than a generic
+  reminder — directly answers "why did my 2/hour schedule only post once"
+  without needing to already know the two settings are independent.
+
+### Fixed
+
+- **"Update profile" did nothing.** Root cause: `<p id="error">`, the
+  panel's only status-message element, was nested inside `#login-card` —
+  which gets `hidden = true` the instant login succeeds. Every message
+  written after that point, including a genuinely successful "Profile
+  updated.", went into an element the browser was no longer rendering at
+  all. Moved it to a page-level sibling, added a real success/failure
+  distinction (was previously reusing the error path even for "Registered.
+  Transaction: ..."), and added the first tests this UI layer has ever had —
+  7 of the 20 new tests fail against the pre-fix code, confirming they'd
+  have caught this.
+- **`posting.maxPostsPerHour` vs. a source's `schedule:` — documented and
+  now warned about, not just silently interacting.** A source configured to
+  fire twice an hour did nothing extra on its own if the (default) budget
+  was still 1/hour — correct behavior, but nothing said so anywhere
+  reachable at the moment it mattered. `config.example.yaml` and the README
+  now say plainly that these are two independent controls, and the startup
+  warning (above) catches the mismatch directly.
+- The Gemini example model in `docs/AI-PROVIDERS.md` and
+  `config.example.yaml` (`gemini-3-pro`) doesn't exist as a real model ID —
+  updated to `gemini-3.7-flash` (the current flagship) with a pointer to
+  Google's live model list, since this specific doc has now gone stale once
+  already.
+- The dashboard's post list and stats now load independently of the status
+  panel, on both login and the initial page load — previously chained
+  (`refresh().then(refreshPosts)`), so a `/api/status` failure unrelated to
+  `/api/posts` silently prevented the dashboard from ever rendering.
+- `runsPerHour` (used by the startup warning above) undercounted schedules
+  using croner's optional seconds field — it sampled only 100 future runs
+  under a stale assumption that one-minute granularity caps cron at 60/hour,
+  when a valid 6-field expression can fire up to 3600/hour. Raised the sample
+  to 3601 so the warning is accurate for every cron expression `isValidCron`
+  actually accepts.
+
+### Security
+
+Found by the mandatory code/security audit pass on the new dashboard code
+(`src/panel/posts.ts`, which is the first code in this project to decode a
+large, node-supplied response). The request side of this path was already
+correctly scoped to the bot's own wallet, but the response is still entirely
+the node's word — no signature or content-addressing backs it — so it's
+handled as untrusted input throughout:
+
+- Post/tag/title data from the node is now stripped of bidi-override and
+  other control characters (U+202E and friends — the same visual-spoofing
+  class `web/src/lib/sanitize.ts` already guards against) before rendering,
+  and title/tag length and tag count are capped.
+- The msgpack payload decode now caps array/string/map/binary sizes
+  (`@msgpack/msgpack`'s `maxStrLength`/`maxArrayLength`/etc.) instead of
+  trusting the node not to send an oversized payload.
+- `lastPostedAt` no longer computes via `Math.max(...timestamps)`, which
+  threw `RangeError: Maximum call stack size exceeded` once the node
+  returned enough posts (reproduced at 200k) — replaced with a `reduce`.
+- Hashtag counting now uses a `null`-prototype accumulator object, so a tag
+  literally named `"constructor"` or `"toString"` can't collide with
+  `Object.prototype`.
+- The post count returned to the panel is now hard-clamped to the requested
+  limit (25) regardless of what the node reports, and a missing/non-array
+  `posts` field degrades to an empty list instead of throwing.
+
+### Added (dependency)
+
+- `@msgpack/msgpack`, version-pinned to the same range `@ogmara/sdk` already
+  depends on, to decode post payloads for the dashboard without a second,
+  potentially-diverging copy in `node_modules` (the same class of issue as an
+  earlier mobile incident with a duplicated `@noble/ed25519`).
+
 ## [0.9.0] - 2026-08-27
 
 First-run convenience: no more manually copying config files or generating a

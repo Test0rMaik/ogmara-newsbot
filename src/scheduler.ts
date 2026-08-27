@@ -30,6 +30,40 @@ export function isValidCron(expression: string): boolean {
   }
 }
 
+/**
+ * How many times this cron expression fires in the hour starting at `from`.
+ *
+ * A snapshot from one point in time, not a guaranteed worst case — an
+ * unevenly-spaced schedule (three fixed times a day, say) could fire more
+ * times in some other hour than this one. Good enough for a startup
+ * diagnostic aimed at the actual common case this exists for: a simple
+ * schedule recurring every N minutes that fires more often than
+ * `posting.maxPostsPerHour` allows, which is genuinely constant hour to hour
+ * and exactly what this catches.
+ */
+export function runsPerHour(
+  expression: string,
+  from: Date = new Date(),
+  options: ScheduleOptions = {},
+): number {
+  const probe = new Cron(expression, {
+    paused: true,
+    ...(options.timezone !== undefined ? { timezone: options.timezone } : {}),
+  });
+  try {
+    const until = new Date(from.getTime() + 3_600_000);
+    // 3601: croner accepts an optional 6th SECONDS field (isValidCron accepts
+    // it too), so the true ceiling is 3600/hour — once a second — not the
+    // 60/hour a minute-only cron would imply. Sampling this many runs even
+    // for a sparse once-a-day schedule is ~20ms (measured), so there's no
+    // real cost to using the true bound rather than an under-count that
+    // silently caps out and reports a number lower than reality.
+    return probe.nextRuns(3601, from).filter((d) => d <= until).length;
+  } finally {
+    probe.stop();
+  }
+}
+
 /** Options for {@link schedule}. */
 export interface ScheduleOptions {
   /** IANA timezone, e.g. "Europe/Berlin". Defaults to the system zone. */

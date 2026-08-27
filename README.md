@@ -119,9 +119,19 @@ Every key is documented inline in [`config.example.yaml`](config.example.yaml).
 
 ### Sources and cadence
 
-Each scheduled run posts **at most one item**. Your cadence is therefore set by
-the cron expression, not by how much your feeds publish — a burst of twenty
-articles doesn't become twenty posts.
+Each scheduled run posts **at most one item**. A source's `schedule:` cron
+controls *when* it's willing to publish — a burst of twenty articles doesn't
+become twenty posts.
+
+That's one of two independent controls, though, not the only one:
+**`posting.maxPostsPerHour` is a separate, hard ceiling on top of every
+source's schedule.** Setting `rss.schedule` to fire twice an hour does nothing
+on its own if `maxPostsPerHour` is still `1` (the default) — the second
+attempt each hour is queued and published once budget frees up, not dropped,
+but not published right away either (see
+[Rate limits and the retry queue](#rate-limits-and-the-retry-queue)). Raise
+**both** if you want a faster cadence. The bot warns at startup if your
+schedules can fire more often than `maxPostsPerHour` allows.
 
 ```yaml
 sources:
@@ -286,13 +296,18 @@ Two more things worth knowing about limits:
 
 ### Control panel
 
-A small browser UI for changing the display name and registering the wallet,
-served alongside the bot's normal schedule (not `--once`):
+A small browser UI, served alongside the bot's normal schedule (not `--once`):
 
 ```yaml
 panel:
   enabled: true
 ```
+
+Two tabs. **Dashboard** (the default view) shows your last 25 posts with
+their reaction/repost/comment counts, total published vs. currently queued,
+hashtag usage, and how long since the last successful post — the fastest way
+to notice an unattended bot has gone quiet. **Settings** holds the display
+name and wallet-registration controls.
 
 The bot **always** signs with its own wallet (`OGMARA_WALLET_KEY`) — the panel
 never holds or asks for anyone else's key. `panel.adminWallets` instead names

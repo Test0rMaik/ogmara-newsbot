@@ -18,6 +18,7 @@ import type { ProfileResult, ProfileSpec, RegisterResult, RegistrationStatus } f
 import { REGISTRATION_COST_KLV } from '../klever.js';
 import { PanelAuth } from './auth.js';
 import { TrustedProxies, isLoopback, resolveClientIp } from './clientip.js';
+import type { PostStats } from './posts.js';
 import { renderPage, renderScript } from './ui.js';
 
 /** Largest request body accepted. Every panel action fits in a few hundred bytes. */
@@ -74,6 +75,10 @@ export interface PanelDeps {
   isWalletBackupPending: () => boolean;
   /** Record that the operator has confirmed the backup. */
   acknowledgeWalletBackup: () => void;
+  /** Recent posts + engagement stats for the dashboard tab. See `posts.ts`. */
+  fetchPostStats: () => Promise<PostStats>;
+  /** How many composed posts are currently waiting on the local retry queue. */
+  queuedCountFn: () => number;
 }
 
 /** Per-instance mutable state, kept out of PanelDeps because it isn't config. */
@@ -309,6 +314,18 @@ async function handle(
       authenticatedAs,
       walletBackupPending,
     });
+    return;
+  }
+
+  if (method === 'GET' && path === '/api/posts') {
+    try {
+      const stats = await deps.fetchPostStats();
+      sendJson(res, 200, { ...stats, queuedCount: deps.queuedCountFn() });
+    } catch (err) {
+      sendJson(res, 502, {
+        error: `could not fetch posts: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
     return;
   }
 

@@ -32,10 +32,11 @@ import {
 } from './ogmara.js';
 import { PanelAuth } from './panel/auth.js';
 import { TrustedProxies } from './panel/clientip.js';
+import { DASHBOARD_POST_LIMIT, fetchPostStats } from './panel/posts.js';
 import { startPanel, type Panel } from './panel/server.js';
 import { PostQueue } from './queue.js';
 import { runOnce, type RunOutcome } from './pipeline.js';
-import { schedule, type ScheduledJob } from './scheduler.js';
+import { runsPerHour, schedule, type ScheduledJob } from './scheduler.js';
 import { ImageDirSource } from './sources/imagedir.js';
 import { RssSource } from './sources/rss.js';
 import { TopicsSource } from './sources/topics.js';
@@ -537,7 +538,7 @@ async function run(args: CliArgs): Promise<number> {
   // immediately, which would start a server nobody could ever reach.
   let panel: Panel | undefined;
   if (effective.panel.enabled) {
-    panel = await startControlPanel(effective, secrets, publisher);
+    panel = await startControlPanel(effective, secrets, publisher, queue);
   }
 
   // One job per enabled source, each on its own cron. They share the run
@@ -562,6 +563,25 @@ async function run(args: CliArgs): Promise<number> {
     });
     jobs.push(job);
     console.log(`Schedule: ${name} "${cron}" — next ${job.nextRun()?.toISOString() ?? 'never'}`);
+  }
+
+  // A schedule controls WHEN the bot attempts a post; posting.maxPostsPerHour
+  // is a separate, independent ceiling on how many of those attempts actually
+  // publish. Setting a source to fire twice an hour does nothing on its own
+  // if the budget is still 1 — the second attempt is queued, not dropped, but
+  // that is easy to mistake for the schedule simply not being applied. Only
+  // meaningful in LIVE mode: dry-run posts are never budget-checked at all.
+  if (!effective.posting.dryRun) {
+    const attemptsPerHour = schedules.reduce((sum, s) => sum + runsPerHour(s.cron), 0);
+    if (attemptsPerHour > effective.posting.maxPostsPerHour) {
+      console.log(
+        `\nNote: your schedule(s) can attempt up to ${attemptsPerHour} post(s) in an hour, ` +
+          `but posting.maxPostsPerHour is ${effective.posting.maxPostsPerHour} — the extra ` +
+          'attempts are queued and published later (see "Rate limits and the retry queue" ' +
+          'in the README), not dropped. Raise posting.maxPostsPerHour if you want them ' +
+          'published as soon as they happen instead.',
+      );
+    }
   }
 
   console.log('\nRunning. Press Ctrl+C to stop.');
@@ -600,6 +620,7 @@ async function startControlPanel(
   config: Config,
   secrets: Secrets,
   publisher: OgmaraPublisher,
+  queue: PostQueue,
 ): Promise<Panel> {
   let trustedProxies: TrustedProxies;
   try {
@@ -639,6 +660,13 @@ async function startControlPanel(
     requireLogin: config.panel.requireLogin,
     isWalletBackupPending: () => isBackupPending(WALLET_BACKUP_PATH),
     acknowledgeWalletBackup: () => acknowledgeBackup(WALLET_BACKUP_PATH),
+    fetchPostStats: () =>
+      fetchPostStats(
+        (address, options) => publisher.client.getUserPosts(address, options),
+        publisher.address,
+        DASHBOARD_POST_LIMIT,
+      ),
+    queuedCountFn: () => queue.size,
   });
 
   console.log(

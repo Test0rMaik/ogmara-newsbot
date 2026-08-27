@@ -68,6 +68,8 @@ interface StartOptions {
   allowedHosts?: string[];
   requireLogin?: boolean;
   walletBackupPending?: boolean;
+  fetchPostStats?: PanelDeps['fetchPostStats'];
+  queuedCount?: number;
 }
 
 async function start(options: StartOptions = {}): Promise<{
@@ -79,6 +81,7 @@ async function start(options: StartOptions = {}): Promise<{
     applyProfile: ReturnType<typeof vi.fn>;
     registerWallet: ReturnType<typeof vi.fn>;
     acknowledgeWalletBackup: ReturnType<typeof vi.fn>;
+    fetchPostStats: ReturnType<typeof vi.fn>;
   };
 }> {
   const auth = new PanelAuth({
@@ -110,6 +113,16 @@ async function start(options: StartOptions = {}): Promise<{
     backupPending = false;
   });
 
+  const fetchPostStatsFn = vi.fn(
+    options.fetchPostStats ??
+      (async () => ({
+        posts: [],
+        totalPublished: 0,
+        hashtagCounts: {},
+        lastPostedAt: null,
+      })),
+  );
+
   const deps: PanelDeps = {
     auth,
     trustedProxies: new TrustedProxies(options.trustedProxyCidrs ?? []),
@@ -128,6 +141,8 @@ async function start(options: StartOptions = {}): Promise<{
     requireLogin: options.requireLogin ?? false,
     isWalletBackupPending: () => backupPending,
     acknowledgeWalletBackup: acknowledgeWalletBackupFn,
+    fetchPostStats: fetchPostStatsFn,
+    queuedCountFn: () => options.queuedCount ?? 0,
   };
 
   const started = await startPanel('127.0.0.1', 0, deps);
@@ -141,6 +156,7 @@ async function start(options: StartOptions = {}): Promise<{
       applyProfile: applyProfileFn,
       registerWallet: registerWalletFn,
       acknowledgeWalletBackup: acknowledgeWalletBackupFn,
+      fetchPostStats: fetchPostStatsFn,
     },
   };
 }
@@ -626,6 +642,64 @@ describe('loopback bypass — forwarding-header presence gate', () => {
     const { baseUrl } = await start({ trustedProxyCidrs: ['10.0.0.0/8'] });
     const res = await fetch(`${baseUrl}/api/status`);
     expect(res.status).toBe(200);
+  });
+});
+
+describe('/api/posts', () => {
+  it('returns the stats from fetchPostStats plus the local queue count', async () => {
+    const { baseUrl } = await start({
+      queuedCount: 3,
+      fetchPostStats: async () => ({
+        posts: [
+          {
+            msgId: 'abc',
+            timestamp: 1_700_000_000_000,
+            title: 'Hello world',
+            tags: ['klever'],
+            reactionCount: 5,
+            repostCount: 2,
+            commentCount: 1,
+          },
+        ],
+        totalPublished: 42,
+        hashtagCounts: { klever: 1 },
+        lastPostedAt: 1_700_000_000_000,
+      }),
+    });
+    const res = await fetch(`${baseUrl}/api/posts`);
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.posts).toHaveLength(1);
+    expect(body.posts[0].title).toBe('Hello world');
+    expect(body.totalPublished).toBe(42);
+    expect(body.hashtagCounts).toEqual({ klever: 1 });
+    expect(body.queuedCount).toBe(3);
+  });
+
+  it('maps a fetch failure to 502 rather than crashing', async () => {
+    const { baseUrl } = await start({
+      fetchPostStats: async () => {
+        throw new Error('node unreachable');
+      },
+    });
+    const res = await fetch(`${baseUrl}/api/posts`);
+    expect(res.status).toBe(502);
+  });
+
+  it('requires authentication for a non-local caller', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/posts`, {
+      headers: { 'X-Forwarded-For': '203.0.113.9' },
+    });
+    expect(res.status).toBe(401);
+    expect(fns.fetchPostStats).not.toHaveBeenCalled();
+  });
+
+  it('allows the localhost bypass, same as every other read route', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/posts`);
+    expect(res.status).toBe(200);
+    expect(fns.fetchPostStats).toHaveBeenCalledTimes(1);
   });
 });
 
