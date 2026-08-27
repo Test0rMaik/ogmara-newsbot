@@ -7,9 +7,10 @@ Point it at news feeds, your own topics, or a folder of images. It composes
 posts with the AI provider of your choice, adds hashtags, and publishes them to
 a decentralized feed under a wallet you control.
 
-> **Status: early development (v0.6.0).** Three sources — news feeds, your own
-> topics, and local image folders — composed by the AI provider of your choice
-> and published on a schedule without duplicates. See [Roadmap](#roadmap).
+> **Status: v0.9.0.** Three sources — news feeds, your own topics, and local
+> image folders — composed by the AI provider of your choice and published on
+> a schedule without duplicates. Ships with a web control panel, Docker
+> packaging, and a first-run `--init` flow. See [Roadmap](#roadmap).
 
 ## Why a dry run by default
 
@@ -26,8 +27,9 @@ live posting.
 
 - Node.js 22 or newer
 - An Ogmara L2 node to publish through (yours or a public one)
-- A **dedicated** Klever wallet for the bot
-- An API key for an AI provider (later phases)
+- A **dedicated** Klever wallet for the bot — `--init` can generate one for you
+  (see [Quickstart](#quickstart)), or bring your own
+- An API key for an AI provider (or a local server, e.g. Ollama — see [Choosing an AI provider](#choosing-an-ai-provider))
 
 ## Quickstart
 
@@ -68,8 +70,11 @@ docker compose up --build
 `--init` needs to run on the host first (once) — Docker's bind mount expects
 `config.yaml` and `.env` to already exist before the container starts.
 Afterward, same files, same `data/` ledger — just containerized.
-`config.yaml` is mounted read-only and `data/` lives in a named volume, so
-neither disappears on a rebuild. If you enable the control panel
+`config.yaml` is mounted read-only and `data/` is bind-mounted from the host
+(not a Docker-managed named volume — deliberately, so the ledger, queue and
+wallet-backup-reminder state `--init` just created on the host are the exact
+same files the container sees, not a separate store), so neither disappears
+on a rebuild. If you enable the control panel
 (`panel.enabled: true`), see the networking note in `docker-compose.yml`
 first: its `bind: 127.0.0.1` default is unreachable through Docker's port
 publishing, for a reason worth understanding before you widen it.
