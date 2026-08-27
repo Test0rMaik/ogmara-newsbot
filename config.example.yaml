@@ -31,14 +31,23 @@ posting:
   # Voluntary content rating: general | teen | mature | explicit
   contentRating: general
 
-  # The bot's own posting cadence. Must be at most 80% of nodeNewsLimitPerHour
-  # so there is headroom for retries — the bot refuses to start otherwise.
+  # The bot's own posting cadence. Checked at startup against the UNVERIFIED
+  # daily ceiling (every wallet starts there), with 80% headroom for retries.
   maxPostsPerHour: 1
 
-  # What the node will actually allow per wallet per hour. The reference node
-  # currently allows 5 and does not expose this over the API, so it has to be
-  # configured. Raise it if you run a node with a higher ceiling.
-  nodeNewsLimitPerHour: 5
+  # What the node allows per wallet. Two windows — a post is refused if EITHER
+  # is exceeded — and both are tiered by on-chain registration.
+  #
+  # These mirror [api.rate_limits] in the node's ogmara.toml and are not
+  # discoverable over the API, so change them if your node is configured
+  # differently. Values below are the l2-node 0.122.0 defaults.
+  #
+  # Registering the wallet is the single biggest lever on throughput: 6x the
+  # daily ceiling. Run `--register` (costs ~4.4 KLV, one time).
+  nodeBurstUnverified: 5      # per 10 minutes
+  nodeBurstRegistered: 20
+  nodeDailyUnverified: 50     # per 24 hours
+  nodeDailyRegistered: 300
 
   # Tag marking posts as bot-authored. Readers of a decentralized feed should
   # be able to tell automated posts apart, so this is on by default. Set to
@@ -121,6 +130,17 @@ ai:
   # How many tags to ask for. The protocol caps the final list at 10, and the
   # bot's own required tags (disclosureTag, alwaysTags) rank ahead of these.
   maxTags: 5
+
+profile:
+  # The bot's on-network identity. Published with `--set-profile`.
+  # Omit a field to leave it unchanged.
+  # displayName: My News Bot
+  # bio: Automated world-news posts. Not a human.
+  # avatarCid: Qm...            # IPFS CID of an avatar image
+
+  # Re-publish the profile on every startup. Off by default: an operator who
+  # edits their profile elsewhere shouldn't have the bot silently revert it.
+  applyOnStart: false
 
 queue:
   # When the node rate-limits a post, the COMPOSED post is parked here and

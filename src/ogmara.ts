@@ -244,6 +244,14 @@ export class OgmaraPublisher {
   readonly #signer: WalletSigner;
   readonly #config: Config;
   readonly #budget: RateBudget;
+  /**
+   * Whether the wallet is on-chain registered.
+   *
+   * Set once at startup. The node applies a 6x higher daily ceiling to
+   * registered wallets (l2-node 0.122.0), so this decides which limits the
+   * bot models and how long it backs off after a 429.
+   */
+  #registered = false;
 
   private constructor(client: OgmaraClient, signer: WalletSigner, config: Config) {
     this.#client = client;
@@ -270,6 +278,40 @@ export class OgmaraPublisher {
     };
 
     return new OgmaraPublisher(client, signer, config);
+  }
+
+  /**
+   * The underlying SDK client, for operations outside the publish path
+   * (profile updates). Exposed rather than proxied so the identity module —
+   * and later the web panel — can use the SDK directly without this class
+   * growing a method per feature.
+   */
+  get client(): OgmaraClient {
+    return this.#client;
+  }
+
+  /** The wallet signer, for callers that must sign outside the publish path. */
+  get signer(): WalletSigner {
+    return this.#signer;
+  }
+
+  /** Tell the publisher the wallet's on-chain tier. */
+  setRegistered(registered: boolean): void {
+    this.#registered = registered;
+  }
+
+  /** The node's daily ceiling for this wallet's current tier. */
+  get dailyLimit(): number {
+    return this.#registered
+      ? this.#config.posting.nodeDailyRegistered
+      : this.#config.posting.nodeDailyUnverified;
+  }
+
+  /** The node's burst ceiling for this wallet's current tier. */
+  get burstLimit(): number {
+    return this.#registered
+      ? this.#config.posting.nodeBurstRegistered
+      : this.#config.posting.nodeBurstUnverified;
   }
 
   /** The bot's wallet address — the identity every post is attributed to. */

@@ -19,16 +19,27 @@ import { z } from 'zod';
 import { isValidCron } from './scheduler.js';
 
 /**
- * Conservative default for the node's per-wallet news rate limit.
+ * The node's per-wallet news limits, as of l2-node 0.122.0.
  *
- * The reference l2-node currently allows 5 news posts/hour/wallet, enforced at
- * the ingress node only. That value is being reworked upstream (tiered by
- * on-chain registration, with burst + sustained windows), and it is *not*
- * discoverable over the API — so it lives here as an operator-tunable number
- * rather than a hardcoded constant. Point the bot at a node with a higher
- * ceiling and raise this to match; there is no code change involved.
+ * Two windows, both enforced — a post is rejected if EITHER is exceeded — and
+ * both tiered by on-chain registration. Registering the bot's wallet raises
+ * the daily ceiling 6x, which is the single biggest lever on how much this bot
+ * can publish.
+ *
+ * Not discoverable over the API, so these are operator-tunable rather than
+ * hardcoded: point the bot at a node with a different `[api.rate_limits]`
+ * config and change these to match, with no code change.
+ *
+ * (Earlier versions modelled a single 5/hour window. That was the pre-0.122.0
+ * shape and is no longer what any current node enforces.)
  */
-export const DEFAULT_NODE_NEWS_LIMIT_PER_HOUR = 5;
+export const NODE_LIMITS = {
+  burstWindowMinutes: 10,
+  burstUnverified: 5,
+  burstRegistered: 20,
+  dailyUnverified: 50,
+  dailyRegistered: 300,
+} as const;
 
 /**
  * Protocol caps on a news post payload (spec §3.5).
@@ -66,14 +77,19 @@ const postingSchema = z
      */
     dryRun: z.boolean().default(true),
     contentRating: contentRating.default('general'),
-    /** Bot's own posting cadence ceiling. Validated against `nodeNewsLimitPerHour`. */
+    /** Bot's own posting cadence ceiling. Validated against the node's limits. */
     maxPostsPerHour: z.number().positive().max(100).default(1),
-    /** What the node will actually allow; see DEFAULT_NODE_NEWS_LIMIT_PER_HOUR. */
-    nodeNewsLimitPerHour: z
-      .int()
-      .positive()
-      .max(10_000)
-      .default(DEFAULT_NODE_NEWS_LIMIT_PER_HOUR),
+    /**
+     * What the node allows per wallet. Mirrors `[api.rate_limits]` in
+     * `ogmara.toml`; see NODE_LIMITS for the l2-node 0.122.0 defaults.
+     *
+     * The bot picks the unverified or registered row based on the wallet's
+     * actual on-chain status, checked at startup.
+     */
+    nodeBurstUnverified: z.int().positive().max(10_000).default(NODE_LIMITS.burstUnverified),
+    nodeBurstRegistered: z.int().positive().max(10_000).default(NODE_LIMITS.burstRegistered),
+    nodeDailyUnverified: z.int().positive().max(100_000).default(NODE_LIMITS.dailyUnverified),
+    nodeDailyRegistered: z.int().positive().max(100_000).default(NODE_LIMITS.dailyRegistered),
     /**
      * Tag marking posts as bot-authored. Transparency by default — readers of a
      * decentralized feed should be able to tell automated posts apart. Set to
@@ -85,15 +101,20 @@ const postingSchema = z
     /** Always append the source article link for feed-derived posts. */
     includeSourceLink: z.boolean().default(true),
   })
-  .refine((p) => p.maxPostsPerHour <= p.nodeNewsLimitPerHour * 0.8, {
-    // Staying under the node's ceiling rather than at it leaves room for
-    // retries and for posts made by the same wallet outside the bot. Running
-    // flush against the limit means the first retry is rejected.
-    message:
-      'posting.maxPostsPerHour must be at most 80% of posting.nodeNewsLimitPerHour — ' +
-      'leave headroom for retries, or raise nodeNewsLimitPerHour if your node allows more',
-    path: ['maxPostsPerHour'],
-  });
+  .refine(
+    // Check against the UNVERIFIED daily ceiling, which is the tier every
+    // wallet starts in — a config that only works once registered would let
+    // the bot start and then fail against the node. 80% rather than 100%
+    // leaves room for retries and for posts made by the same wallet elsewhere.
+    (p) => p.maxPostsPerHour * 24 <= p.nodeDailyUnverified * 0.8,
+    {
+      message:
+        'posting.maxPostsPerHour x 24h exceeds 80% of posting.nodeDailyUnverified. ' +
+        'Every wallet starts unverified, so a higher cadence would fail against the node ' +
+        'until you register (see `--register`, which raises the daily ceiling 6x)',
+      path: ['maxPostsPerHour'],
+    },
+  );
 
 const feedSchema = z.object({
   url: z.url({ protocol: /^https?$/ }),
@@ -169,6 +190,23 @@ const aiSchema = z
     path: ['baseUrl'],
   });
 
+const profileSchema = z.object({
+  /** Display name shown on the bot's posts. Omit to leave unchanged. */
+  displayName: z.string().min(1).max(64).optional(),
+  /** Short bio. Omit to leave unchanged. */
+  bio: z.string().max(500).optional(),
+  /** IPFS CID of an avatar image. Omit to leave unchanged. */
+  avatarCid: z.string().min(1).optional(),
+  /**
+   * Publish the profile on every startup.
+   *
+   * Off by default: it is a signed message and so cheap but not free, and an
+   * operator who edits their profile elsewhere should not have the bot
+   * silently revert it on the next restart. Use `--set-profile` instead.
+   */
+  applyOnStart: z.boolean().default(false),
+});
+
 const queueSchema = z.object({
   /** Where composed-but-unpublished posts wait. */
   path: z.string().min(1).default('data/queue.json'),
@@ -194,6 +232,7 @@ const configSchema = z.object({
   posting: postingSchema.prefault({}),
   sources: sourcesSchema.prefault({}),
   ai: aiSchema.prefault({}),
+  profile: profileSchema.prefault({}),
   queue: queueSchema.prefault({}),
   storage: storageSchema.prefault({}),
 });

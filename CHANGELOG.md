@@ -5,6 +5,76 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-27
+
+Bot identity: a display name, and on-chain registration for the higher posting
+tier. Both are CLI commands whose logic lives in plain modules, so the web
+control panel (P5) can call the same code rather than reimplementing it.
+
+### Added
+
+- **`--set-profile`** publishes `profile.displayName` / `bio` / `avatarCid`
+  from config as a signed `ProfileUpdate`. Works on an unregistered wallet
+  (the spec puts `ProfileUpdate` in the unverified set) and is last-write-wins,
+  so re-running is harmless. `profile.applyOnStart` re-publishes on every
+  start, off by default so the bot never silently reverts a profile edited
+  elsewhere.
+
+- **`--register`** registers the bot's wallet on-chain, raising the node's
+  ceiling from 50 to **300 posts/day** and 5 to 20 per 10 minutes — 6x the
+  daily volume.
+
+  It **spends ~4.4 KLV irreversibly**, so it checks current status and balance
+  first, prints what the spend buys, and asks for confirmation. It never runs
+  implicitly, and on a non-TTY it **refuses rather than assuming consent** —
+  an unattended process must not spend funds because nobody was there to say
+  no. `--yes` opts in explicitly for scripted use.
+
+- `src/klever.ts` — minimal Klever build/sign/broadcast, used only for
+  registration. The bot holds the raw Ed25519 key, so it signs locally; the
+  web client goes through the browser extension precisely because a browser
+  cannot. Ported from the verified flow in `smart-contract/tools/lib.js`.
+  Note the sharp edges it documents: `/transaction/send` *builds* rather than
+  sends, `/transaction/decode` is how you get the hash, that hash is signed raw
+  with **no** message prefix (unlike Ogmara message signing), and a response
+  can carry both `data.result` and `error` at once.
+
+- Startup reports whether the wallet is registered and the ceiling that
+  implies. A chain lookup failure is non-fatal — an unreachable chain should
+  not stop the bot posting at the conservative rate.
+
+### Changed
+
+- **The rate model now matches the node.** `posting.nodeNewsLimitPerHour`
+  modelled a single 5/hour window that **no current node enforces**: since
+  l2-node 0.122.0 there are two windows (burst per 10 min, sustained per 24 h),
+  both enforced, both tiered by registration. Against that, the old model was
+  simultaneously too conservative on burst (5/10min is 30/hour available) and
+  too permissive on the day (1/hour × 24 = 120 vs a real cap of 50).
+
+  Replaced by `nodeBurstUnverified` / `nodeBurstRegistered` /
+  `nodeDailyUnverified` / `nodeDailyRegistered`, with the publisher selecting
+  the row from the wallet's actual on-chain status. The startup cadence check
+  now validates against the *unregistered* daily ceiling, since every wallet
+  starts there and a config that only worked once registered would fail
+  against the node.
+
+- README's "Rate limits — the one setting people get wrong" section described
+  the superseded hourly model and has been removed; the two facts still true
+  (ingress-only enforcement, not API-discoverable) moved into the registration
+  section.
+
+### Notes
+
+- 141 tests, typecheck clean, `npm audit` 0 vulnerabilities.
+- Verified against live testnet: `--register` queried the real SC and Klever
+  account API and correctly refused an unfunded wallet with the balance and
+  the cost; `--set-profile` published to darkw0rld and the node's
+  `/api/v1/users/:address` confirms the stored `display_name` and `bio`.
+- **Not verified:** a completed registration transaction — that needs a funded
+  wallet. The build/sign/broadcast flow is ported from an implementation used
+  for real SC upgrades, but the bot has not yet put a TX on chain.
+
 ## [0.4.0] - 2026-08-26
 
 Pre-release hardening. A four-stage audit (code + security in parallel, then

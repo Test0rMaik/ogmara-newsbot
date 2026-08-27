@@ -8,10 +8,13 @@
  */
 
 import { statSync } from 'node:fs';
+import { createInterface } from 'node:readline/promises';
 import { config as loadDotenv } from 'dotenv';
 import { AiConfigError, createProvider } from './ai/index.js';
 import { loadTemplate } from './ai/prompt.js';
 import { ConfigError, loadConfig, loadSecrets, type Config, type Secrets } from './config.js';
+import { applyProfile, checkRegistration, registerWallet } from './identity.js';
+import { KleverError, REGISTRATION_COST_KLV } from './klever.js';
 import { Ledger } from './ledger.js';
 import { LockError, acquireDataLock } from './lock.js';
 import {
@@ -32,6 +35,12 @@ interface CliArgs {
   forceDryRun: boolean;
   /** Run the pipeline once and exit instead of scheduling. */
   once: boolean;
+  /** Publish the configured profile and exit. */
+  setProfile: boolean;
+  /** Register the wallet on-chain and exit. Spends KLV. */
+  register: boolean;
+  /** Skip the interactive confirmation on --register. For scripted use. */
+  assumeYes: boolean;
   showHelp: boolean;
 }
 
@@ -40,6 +49,9 @@ function parseArgs(argv: readonly string[]): CliArgs {
     configPath: 'config.yaml',
     forceDryRun: false,
     once: false,
+    setProfile: false,
+    register: false,
+    assumeYes: false,
     showHelp: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -48,6 +60,9 @@ function parseArgs(argv: readonly string[]): CliArgs {
     if (arg === '--help' || arg === '-h') args.showHelp = true;
     else if (arg === '--dry-run') args.forceDryRun = true;
     else if (arg === '--once') args.once = true;
+    else if (arg === '--set-profile') args.setProfile = true;
+    else if (arg === '--register') args.register = true;
+    else if (arg === '--yes' || arg === '-y') args.assumeYes = true;
     else if (arg === '--config') {
       const next = argv[i + 1];
       if (next === undefined) throw new ConfigError('--config requires a path argument');
@@ -71,6 +86,13 @@ Options:
   --config <path>   Config file to use (default: config.yaml)
   --dry-run         Compose and print without publishing, overriding config
   -h, --help        Show this help
+
+Identity:
+  --set-profile     Publish the display name / bio from your config, then exit
+  --register        Register this wallet on-chain, then exit. SPENDS ~4.4 KLV
+                    and cannot be undone. Raises the node's daily posting
+                    ceiling from 50 to 300. Asks for confirmation first.
+  -y, --yes         Skip that confirmation (for scripted use)
 
 Secrets come from the environment (or a .env file), never the config file:
   OGMARA_WALLET_KEY   Bot wallet private key, 64 hex characters
@@ -198,6 +220,118 @@ function reportOutcome(outcome: RunOutcome, address: string): void {
   }
 }
 
+/**
+ * Ask the operator to confirm an irreversible, money-spending action.
+ *
+ * Returns false on a non-TTY (cron, systemd, a pipe) rather than assuming
+ * consent — an unattended process must never spend funds because nobody was
+ * there to say no. Scripted callers opt in explicitly with --yes.
+ */
+async function confirm(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY) {
+    console.error('Not an interactive terminal — refusing to assume consent. Re-run with --yes.');
+    return false;
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(`${question} [y/N] `);
+    return /^y(es)?$/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/** `--set-profile`: publish the configured display name / bio. */
+async function runSetProfile(config: Config, secrets: Secrets): Promise<number> {
+  const publisher = await OgmaraPublisher.create(config, secrets);
+  await publisher.health(); // also enforces the network match
+  console.log(`Wallet:  ${publisher.address}`);
+
+  const result = await applyProfile(publisher.client, {
+    displayName: config.profile.displayName,
+    bio: config.profile.bio,
+    avatarCid: config.profile.avatarCid,
+  });
+
+  if (result.status === 'nothing-to-do') {
+    console.error(
+      '\nNothing to publish: set profile.displayName (and optionally bio, avatarCid) ' +
+        'in your config first.',
+    );
+    return 2;
+  }
+  console.log(`Profile updated${result.displayName !== undefined ? ` — display name is now "${result.displayName}"` : ''}.`);
+  return 0;
+}
+
+/** `--register`: register the wallet on-chain after explicit confirmation. */
+async function runRegister(config: Config, secrets: Secrets, assumeYes: boolean): Promise<number> {
+  const publisher = await OgmaraPublisher.create(config, secrets);
+  const network = config.node.network;
+  console.log(`Wallet:  ${publisher.address}`);
+  console.log(`Network: ${network}\n`);
+
+  const status = await checkRegistration(network, publisher.address);
+  if (status.registered) {
+    const when = new Date(status.registeredAt * 1000).toISOString().slice(0, 10);
+    console.log(`Already registered (since ${when}). Nothing to do.`);
+    console.log(
+      `Daily posting ceiling: ${config.posting.nodeDailyRegistered} ` +
+        `(vs ${config.posting.nodeDailyUnverified} unregistered).`,
+    );
+    return 0;
+  }
+
+  console.log('This wallet is NOT registered on-chain.\n');
+  console.log(`  Cost:     ~${REGISTRATION_COST_KLV} KLV, non-refundable`);
+  console.log(`  Balance:  ${status.balanceKlv.toFixed(4)} KLV`);
+  console.log(
+    `  Unlocks:  ${config.posting.nodeDailyRegistered} posts/day instead of ` +
+      `${config.posting.nodeDailyUnverified}, and ` +
+      `${config.posting.nodeBurstRegistered} per 10 min instead of ` +
+      `${config.posting.nodeBurstUnverified}\n`,
+  );
+
+  if (!status.canAfford) {
+    console.error(
+      `Insufficient funds: need ~${REGISTRATION_COST_KLV} KLV, wallet holds ` +
+        `${status.balanceKlv.toFixed(4)}. Send KLV to ${publisher.address} and retry.`,
+    );
+    return 2;
+  }
+
+  if (!assumeYes && !(await confirm('Register this wallet on-chain?'))) {
+    console.log('Cancelled. Nothing was spent.');
+    return 0;
+  }
+
+  console.log('\nSubmitting registration…');
+  const result = await registerWallet(network, publisher.signer, hexToKey(secrets.walletKeyHex));
+  switch (result.status) {
+    case 'already-registered':
+      console.log('Already registered — nothing was spent.');
+      return 0;
+    case 'insufficient-funds':
+      console.error(`Insufficient funds: need ${result.requiredKlv} KLV, have ${result.balanceKlv}.`);
+      return 2;
+    case 'registered':
+      console.log(`Registered. Transaction: ${result.txHash}`);
+      console.log(`  ${result.explorerUrl}`);
+      console.log(
+        '\nThe node picks this up via its chain scanner, usually within a minute. ' +
+          'Raise posting.maxPostsPerHour in your config to use the higher ceiling.',
+      );
+      return 0;
+  }
+}
+
+/** Decode the operator's 64-char hex wallet key to raw bytes. */
+function hexToKey(hex: string): Uint8Array {
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
 async function run(args: CliArgs): Promise<number> {
   const config: Config = loadConfig(args.configPath);
   const secrets: Secrets = loadSecrets();
@@ -221,6 +355,25 @@ async function run(args: CliArgs): Promise<number> {
   // overwrite each other's records and republish items.
   acquireDataLock(effective.storage.ledgerPath);
 
+  // Registration decides the node's ceiling for this wallet (6x on the daily
+  // limit), so the publisher must know it before modelling any budget. A
+  // failure here is non-fatal — the chain being unreachable should not stop
+  // the bot posting at the conservative unregistered rate.
+  try {
+    const reg = await checkRegistration(effective.node.network, publisher.address);
+    publisher.setRegistered(reg.registered);
+    console.log(
+      `Wallet:  ${reg.registered ? 'REGISTERED' : 'unregistered'} on-chain — ` +
+        `node allows ${publisher.dailyLimit}/day, ${publisher.burstLimit}/10min` +
+        `${reg.registered ? '' : '  (run --register to raise this 6x)'}`,
+    );
+  } catch (err) {
+    console.warn(
+      `  warning: could not check on-chain registration (${err instanceof Error ? err.message : err}); ` +
+        'assuming unregistered limits.',
+    );
+  }
+
   const ledger = Ledger.load(effective.storage.ledgerPath, effective.storage.retentionDays);
   console.log(`Ledger:  ${effective.storage.ledgerPath} (${ledger.size} entries)`);
 
@@ -233,6 +386,15 @@ async function run(args: CliArgs): Promise<number> {
 
   const provider = await createProvider(effective.ai, secrets);
   console.log(`AI:      ${provider.id} / ${provider.model}`);
+
+  if (effective.profile.applyOnStart) {
+    const result = await applyProfile(publisher.client, {
+      displayName: effective.profile.displayName,
+      bio: effective.profile.bio,
+      avatarCid: effective.profile.avatarCid,
+    });
+    if (result.status === 'updated') console.log('Profile: published from config');
+  }
 
   const template = loadTemplate(effective.ai.promptPath);
 
@@ -302,6 +464,14 @@ async function main(): Promise<void> {
   }
 
   try {
+    if (args.setProfile || args.register) {
+      const config = loadConfig(args.configPath);
+      const secrets = loadSecrets();
+      process.exitCode = args.setProfile
+        ? await runSetProfile(config, secrets)
+        : await runRegister(config, secrets, args.assumeYes);
+      return;
+    }
     process.exitCode = await run(args);
   } catch (err) {
     // Config and payload problems are the operator's to fix and deserve a
@@ -311,6 +481,7 @@ async function main(): Promise<void> {
       err instanceof InvalidPostError ||
       err instanceof AiConfigError ||
       err instanceof LockError ||
+      err instanceof KleverError ||
       err instanceof NetworkMismatchError
     ) {
       console.error(`\n${err.name}: ${err.message}`);
