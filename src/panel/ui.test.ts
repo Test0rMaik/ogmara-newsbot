@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { renderPage, renderScript } from './ui.js';
 
 /**
@@ -204,6 +204,33 @@ describe('dashboard tab', () => {
     expect(fn).toContain("'never'");
   });
 
+  it('uses roughly 80% of the screen width rather than a fixed narrow column', () => {
+    expect(page).toMatch(/width:\s*80%/);
+  });
+
+  it('links a post title to its ogmara.org detail page, using a validated msgId', () => {
+    const constDecl = /const MSG_ID_RE = [^;]+;/.exec(script)![0];
+    const fn = extractFunction(script, 'newsPostUrl');
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const newsPostUrl = new Function(`${constDecl}\nreturn (${fn});`)();
+    const validId = 'a'.repeat(64);
+    expect(newsPostUrl(validId)).toBe('https://ogmara.org/app/#/news/' + validId);
+    // A node-supplied msgId is untrusted input — anything not exactly 64 hex
+    // chars must not become a link at all (renderPost falls back to plain
+    // text), the same defensive posture web/src/lib/share.ts's own
+    // sanitizeMsgId takes.
+    expect(newsPostUrl('not-hex')).toBeNull();
+    expect(newsPostUrl('a'.repeat(63))).toBeNull();
+    expect(newsPostUrl('a'.repeat(65))).toBeNull();
+    expect(newsPostUrl('')).toBeNull();
+  });
+
+  it('renderPost opens the link in a new tab without granting it window.opener', () => {
+    const fn = extractFunction(script, 'renderPost');
+    expect(fn).toContain("target = '_blank'");
+    expect(fn).toMatch(/rel = ['"]noopener noreferrer['"]/);
+  });
+
   it('formatRelativeTime never divides by zero or returns NaN-shaped output for "now"', () => {
     // Executed for real, not just pattern-matched — this one is pure and
     // side-effect-free, so there's no reason to settle for a string check.
@@ -215,6 +242,86 @@ describe('dashboard tab', () => {
     expect(formatRelativeTime(Date.now() - 60_000)).toBe('1 minute ago');
     expect(formatRelativeTime(Date.now() - 3 * 3_600_000)).toBe('3 hours ago');
     expect(formatRelativeTime(Date.now() - 2 * 86_400_000)).toBe('2 days ago');
+  });
+});
+
+describe('engagement history chart', () => {
+  it('is present as the first element inside the dashboard tab', () => {
+    const dashboardDiv = /<div id="tab-dashboard"[^>]*>([\s\S]*?)<div id="tab-settings"/.exec(page);
+    expect(dashboardDiv).not.toBeNull();
+    const dashboardStart = dashboardDiv![1]!.trimStart();
+    expect(dashboardStart.startsWith('<div class="chart-card">')).toBe(true);
+  });
+
+  it('has one metric button per reactions/reposts/comments, and one range button per monthly/yearly/overall', () => {
+    for (const metric of ['reactions', 'reposts', 'comments']) {
+      expect(page).toContain(`data-metric="${metric}"`);
+    }
+    for (const range of ['month', 'year', 'all']) {
+      expect(page).toContain(`data-range="${range}"`);
+    }
+  });
+
+  it("the chart's own metric/range buttons don't collide with the dashboard/settings tab switcher", () => {
+    // A shared `.tab-btn` class here would mean the generic
+    // `document.querySelectorAll('.tab-btn')` click handler (wired to
+    // switchTab) also fires for these buttons, calling switchTab(undefined)
+    // since they carry data-metric/data-range, not data-tab — which would
+    // hide every tab-content pane. Distinct classes are load-bearing, not
+    // cosmetic.
+    const metricButtons = /<button class="([^"]*)"[^>]*data-metric=/.exec(page);
+    const rangeButtons = /<button class="([^"]*)"[^>]*data-range=/.exec(page);
+    expect(metricButtons![1]).not.toMatch(/\btab-btn\b/);
+    expect(rangeButtons![1]).not.toMatch(/\btab-btn\b/);
+  });
+
+  it('minMax never uses Math.min(...arr)/Math.max(...arr), which blows the call stack on a large array', () => {
+    const fn = extractFunction(script, 'minMax');
+    expect(fn).not.toMatch(/Math\.(min|max)\(\.\.\./);
+  });
+
+  it('renderChart clears the SVG via replaceChildren, never innerHTML', () => {
+    const fn = extractFunction(script, 'renderChart');
+    expect(fn).toContain('replaceChildren()');
+  });
+
+  it('shows the empty state when there are fewer than two points in the selected range', () => {
+    const fn = extractFunction(script, 'renderChart');
+    expect(fn).toMatch(/points\.length < 2/);
+  });
+
+  it('refreshChart fetches /api/stats-history and never uses innerHTML', () => {
+    const fn = extractFunction(script, 'refreshChart');
+    expect(fn).toContain("api('/api/stats-history'");
+    expect(script).not.toContain('innerHTML');
+  });
+
+  it('refreshChart clears any stale chart and hides the empty-state text on a fetch failure, rather than showing both messages at once', () => {
+    const fn = extractFunction(script, 'refreshChart');
+    expect(fn).toMatch(/catch[\s\S]*replaceChildren\(\)/);
+    expect(fn).toMatch(/catch[\s\S]*chart-empty['"]\)\.hidden = true/);
+  });
+
+  it('renderChart matches the SVG viewBox to its actual rendered width, so the polyline and labels are never stretched non-uniformly', () => {
+    const fn = extractFunction(script, 'renderChart');
+    expect(fn).toContain('svg.clientWidth');
+    expect(fn).toMatch(/setAttribute\('viewBox'/);
+  });
+
+  it('refreshChart is called alongside refreshPosts on login, tab switch, and initial load', () => {
+    expect(extractFunction(script, 'login')).toMatch(/await refreshChart\(\);/);
+    expect(extractFunction(script, 'switchTab')).toMatch(/refreshChart\(\)/);
+    // Initial load: both run independently at the bottom of the script, not
+    // just inside a function — same "must not be chained" reasoning as
+    // refreshPosts already carries for this exact spot.
+    const tail = script.slice(script.lastIndexOf('refresh().catch'));
+    expect(tail).toContain('refreshPosts();');
+    expect(tail).toContain('refreshChart();');
+  });
+
+  it('wires click listeners for both the metric and range buttons', () => {
+    expect(script).toContain("querySelectorAll('.chart-metric-btn')");
+    expect(script).toContain("querySelectorAll('.range-btn')");
   });
 });
 

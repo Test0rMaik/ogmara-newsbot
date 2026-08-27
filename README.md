@@ -139,10 +139,18 @@ sources:
     enabled: true
     schedule: "0 * * * *"    # hourly, on the hour
     maxAgeDays: 2            # skip anything older
+    fetchImages: true        # attach an item's own thumbnail, when the feed has one
     feeds:
       - url: https://feeds.bbci.co.uk/news/world/rss.xml
         publisher: BBC News
 ```
+
+When a feed item carries its own illustrative image (an `<enclosure>`,
+`media:thumbnail`/`media:content`, or an Atom `rel="enclosure"` link),
+`fetchImages: true` (the default) downloads and attaches it alongside the
+AI-written text — decorative only, never shown to the model. It's
+best-effort: a dead link, an oversized image, or the node's IPFS backend
+being down costs the image, never the post.
 
 ### Your own topics
 
@@ -303,11 +311,20 @@ panel:
   enabled: true
 ```
 
-Two tabs. **Dashboard** (the default view) shows your last 25 posts with
-their reaction/repost/comment counts, total published vs. currently queued,
-hashtag usage, and how long since the last successful post — the fastest way
-to notice an unattended bot has gone quiet. **Settings** holds the display
-name and wallet-registration controls.
+Two tabs. **Dashboard** (the default view) opens with a **reactions / reposts
+/ comments history chart** — switch metric via its own tabs, and time range
+via Monthly / Yearly / Overall — built from periodic snapshots the bot takes
+of your account's totals (`stats:` in the config; off only if you also turn
+off the panel). Below that: your last 25 posts, each linking out to its live
+page on [ogmara.org](https://ogmara.org), with their reaction/repost/comment
+counts; total published vs. currently queued; hashtag usage; and how long
+since the last successful post — the fastest way to notice an unattended bot
+has gone quiet. **Settings** holds the display name and wallet-registration
+controls.
+
+The history chart needs at least two snapshots before it shows anything —
+expect an empty chart for the first `stats.schedule` interval (6 hours by
+default) after first enabling the panel.
 
 The bot **always** signs with its own wallet (`OGMARA_WALLET_KEY`) — the panel
 never holds or asks for anyone else's key. `panel.adminWallets` instead names

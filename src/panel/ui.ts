@@ -35,8 +35,8 @@ export function renderPage(ctx: PageContext): string {
 <title>Ogmara Newsbot Panel</title>
 <style>
   :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem;
-         background: #12141a; color: #e6e6e6; }
+  body { font-family: system-ui, sans-serif; width: 80%; max-width: 1600px; min-width: 320px;
+         margin: 2rem auto; padding: 0 1rem; background: #12141a; color: #e6e6e6; box-sizing: border-box; }
   h1 { font-size: 1.2rem; }
   .muted { color: #9aa0a8; font-size: 0.85rem; }
   .card { background: #1c1f27; border: 1px solid #2a2e38; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
@@ -71,12 +71,28 @@ export function renderPage(ctx: PageContext): string {
   .post-row { border-bottom: 1px solid #2a2e38; padding: 0.6rem 0; }
   .post-row:last-child { border-bottom: none; }
   .post-title { font-size: 0.95rem; }
+  .post-title a { color: inherit; text-decoration: none; }
+  .post-title a:hover { text-decoration: underline; }
   .post-meta { color: #9aa0a8; font-size: 0.8rem; margin-top: 0.2rem; }
   .post-meta span { margin-right: 1rem; }
 
   .hashtag-list { display: flex; flex-wrap: wrap; gap: 0.5rem; padding: 0; margin: 0; list-style: none; }
   .hashtag-list li { background: #12141a; border: 1px solid #2a2e38; border-radius: 999px;
                       padding: 0.2rem 0.7rem; font-size: 0.85rem; }
+
+  .chart-card { margin: 0 0 1.2rem; }
+  .chart-metrics { display: flex; gap: 0.5rem; border-bottom: 1px solid #2a2e38; margin-bottom: 0.5rem; }
+  .chart-metric-btn { background: none; color: #9aa0a8; border: none; border-bottom: 2px solid transparent;
+                       padding: 0.4rem 0.25rem; margin-bottom: -1px; cursor: pointer; font-size: 0.9rem;
+                       font-family: inherit; }
+  .chart-metric-btn.active { color: #e6e6e6; border-bottom-color: #3a6ff7; }
+  .chart-metric-btn:hover:not(.active) { color: #c8ccd2; }
+  .chart-range { display: flex; gap: 0.4rem; margin: 0.5rem 0; }
+  .range-btn { background: #1c1f27; color: #9aa0a8; border: 1px solid #2a2e38; border-radius: 999px;
+               padding: 0.2rem 0.8rem; font-size: 0.8rem; cursor: pointer; font-family: inherit; }
+  .range-btn.active { color: #e6e6e6; border-color: #3a6ff7; }
+  #chart-svg { width: 100%; height: 200px; background: #12141a; border: 1px solid #2a2e38;
+               border-radius: 8px; display: block; }
 </style>
 </head>
 <body>
@@ -110,6 +126,22 @@ export function renderPage(ctx: PageContext): string {
     </nav>
 
     <div id="tab-dashboard" class="tab-content">
+      <div class="chart-card">
+        <nav class="chart-metrics">
+          <button class="chart-metric-btn active" id="chart-metric-reactions" data-metric="reactions">Reactions</button>
+          <button class="chart-metric-btn" id="chart-metric-reposts" data-metric="reposts">Reposts</button>
+          <button class="chart-metric-btn" id="chart-metric-comments" data-metric="comments">Comments</button>
+        </nav>
+        <div class="chart-range">
+          <button class="range-btn active" id="chart-range-month" data-range="month">Monthly</button>
+          <button class="range-btn" id="chart-range-year" data-range="year">Yearly</button>
+          <button class="range-btn" id="chart-range-all" data-range="all">Overall</button>
+        </div>
+        <p class="muted error" id="chart-error" hidden></p>
+        <p class="muted" id="chart-empty" hidden>Not enough history yet — check back after a few snapshots.</p>
+        <svg id="chart-svg" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+      </div>
+
       <p id="dashboard-error" class="error"></p>
       <dl class="quick-stats" id="quick-stats"></dl>
 
@@ -226,6 +258,7 @@ async function login() {
     if (err && err.status !== 401) showError(err.message || String(err));
   });
   await refreshPosts();
+  await refreshChart();
 }
 
 async function logout() {
@@ -257,7 +290,10 @@ function switchTab(name) {
   // (the retry queue actually drains over time), so leaving it frozen is
   // exactly the "looks like nothing is happening" failure mode this panel
   // already had once this session.
-  if (name === 'dashboard') refreshPosts();
+  if (name === 'dashboard') {
+    refreshPosts();
+    refreshChart();
+  }
 }
 
 /**
@@ -289,13 +325,33 @@ function setQuickStat(dl, label, value) {
   dl.appendChild(wrap);
 }
 
+/** 64 lowercase-or-uppercase hex chars — same shape the web client's own
+ *  \`sanitizeMsgId\` (web/src/lib/share.ts) requires before it will build a
+ *  link, reproduced here since a node-supplied msgId is untrusted input and
+ *  must be validated before it becomes part of an href. */
+const MSG_ID_RE = /^[0-9a-fA-F]{64}$/;
+
+function newsPostUrl(msgId) {
+  return MSG_ID_RE.test(msgId) ? 'https://ogmara.org/app/#/news/' + msgId.toLowerCase() : null;
+}
+
 function renderPost(post) {
   const row = document.createElement('div');
   row.className = 'post-row';
 
   const title = document.createElement('div');
   title.className = 'post-title';
-  title.textContent = post.title;
+  const url = newsPostUrl(post.msgId);
+  if (url) {
+    const link = document.createElement('a');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = post.title;
+    title.appendChild(link);
+  } else {
+    title.textContent = post.title;
+  }
   row.appendChild(title);
 
   const meta = document.createElement('div');
@@ -350,6 +406,145 @@ async function refreshPosts() {
     }
   } catch (err) {
     dashboardErrorEl.textContent = err.message || String(err);
+  }
+}
+
+let chartHistory = null;
+let chartMetric = 'reactions';
+let chartRange = 'month';
+
+const CHART_METRIC_FIELD = { reactions: 'totalReactions', reposts: 'totalReposts', comments: 'totalComments' };
+const CHART_RANGE_MS = { month: 30 * 86400000, year: 365 * 86400000, all: Infinity };
+
+/** Smallest and largest value in a plain array of finite numbers, without
+ *  \`Math.min(...arr)\`/\`Math.max(...arr)\` — spreading into either blows the
+ *  call stack once the array is large enough, and history length is bounded
+ *  by retention, not by anything this function controls. */
+function minMax(values) {
+  let min = Infinity;
+  let max = -Infinity;
+  for (const v of values) {
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  return [min, max];
+}
+
+function formatChartDate(ms) {
+  const d = new Date(ms);
+  return (d.getMonth() + 1) + '/' + d.getDate();
+}
+
+function selectChartMetric(metric) {
+  chartMetric = metric;
+  for (const btn of document.querySelectorAll('.chart-metric-btn')) {
+    btn.classList.toggle('active', btn.dataset.metric === metric);
+  }
+  renderChart();
+}
+
+function selectChartRange(range) {
+  chartRange = range;
+  for (const btn of document.querySelectorAll('.range-btn')) {
+    btn.classList.toggle('active', btn.dataset.range === range);
+  }
+  renderChart();
+}
+
+function renderChart() {
+  const svg = document.getElementById('chart-svg');
+  const emptyEl = document.getElementById('chart-empty');
+  svg.replaceChildren();
+
+  if (!chartHistory || chartHistory.length === 0) {
+    emptyEl.hidden = false;
+    return;
+  }
+
+  const now = Date.now();
+  const windowMs = CHART_RANGE_MS[chartRange];
+  const field = CHART_METRIC_FIELD[chartMetric];
+  const points = chartHistory.filter((s) => windowMs === Infinity || now - s.timestamp <= windowMs);
+
+  if (points.length < 2) {
+    emptyEl.hidden = false;
+    return;
+  }
+  emptyEl.hidden = true;
+
+  // Match the viewBox to the SVG's actual rendered width so 1 viewBox unit
+  // is exactly 1 CSS pixel on both axes — a fixed "viewBox 0 0 600 200"
+  // against a full-width (often 1000px+) card stretched the x-axis relative
+  // to y, visibly distorting the polyline's stroke width and smearing the
+  // text labels. clientWidth is 0 before first layout (falls back to 600).
+  const width = svg.clientWidth || 600;
+  const height = 200;
+  const pad = 28;
+  svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+  const xs = points.map((p) => p.timestamp);
+  const ys = points.map((p) => p[field]);
+  const [minX, maxX] = minMax(xs);
+  let [minY, maxY] = minMax(ys);
+  minY = Math.min(0, minY);
+  if (maxY === minY) maxY = minY + 1;
+
+  const scaleX = (x) => pad + ((x - minX) / (maxX - minX || 1)) * (width - 2 * pad);
+  const scaleY = (y) => height - pad - ((y - minY) / (maxY - minY)) * (height - 2 * pad);
+
+  const ns = 'http://www.w3.org/2000/svg';
+  const coords = points.map((p) => scaleX(p.timestamp) + ',' + scaleY(p[field])).join(' ');
+  const polyline = document.createElementNS(ns, 'polyline');
+  polyline.setAttribute('points', coords);
+  polyline.setAttribute('fill', 'none');
+  polyline.setAttribute('stroke', '#3a6ff7');
+  polyline.setAttribute('stroke-width', '2');
+  svg.appendChild(polyline);
+
+  const startLabel = document.createElementNS(ns, 'text');
+  startLabel.setAttribute('x', String(pad));
+  startLabel.setAttribute('y', String(height - 8));
+  startLabel.setAttribute('fill', '#9aa0a8');
+  startLabel.setAttribute('font-size', '10');
+  startLabel.textContent = formatChartDate(minX);
+  svg.appendChild(startLabel);
+
+  const endLabel = document.createElementNS(ns, 'text');
+  endLabel.setAttribute('x', String(width - pad));
+  endLabel.setAttribute('y', String(height - 8));
+  endLabel.setAttribute('fill', '#9aa0a8');
+  endLabel.setAttribute('font-size', '10');
+  endLabel.setAttribute('text-anchor', 'end');
+  endLabel.textContent = formatChartDate(maxX);
+  svg.appendChild(endLabel);
+
+  const latestLabel = document.createElementNS(ns, 'text');
+  latestLabel.setAttribute('x', String(width - pad));
+  latestLabel.setAttribute('y', String(pad - 10));
+  latestLabel.setAttribute('fill', '#e6e6e6');
+  latestLabel.setAttribute('font-size', '12');
+  latestLabel.setAttribute('text-anchor', 'end');
+  latestLabel.textContent = String(ys[ys.length - 1]);
+  svg.appendChild(latestLabel);
+}
+
+async function refreshChart() {
+  const errorEl = document.getElementById('chart-error');
+  errorEl.hidden = true;
+  errorEl.textContent = '';
+  try {
+    const result = await api('/api/stats-history', { method: 'GET' });
+    chartHistory = Array.isArray(result.snapshots) ? result.snapshots : [];
+    renderChart();
+  } catch (err) {
+    chartHistory = null;
+    // Clear any previously rendered chart and make sure the "not enough
+    // history" empty-state text is hidden — showing that alongside the
+    // error below would tell the operator two contradictory things at once
+    // (nothing wrong vs. something failed).
+    document.getElementById('chart-svg').replaceChildren();
+    document.getElementById('chart-empty').hidden = true;
+    errorEl.textContent = err.message || String(err);
+    errorEl.hidden = false;
   }
 }
 
@@ -466,6 +661,12 @@ document.getElementById('backup-ack-btn').addEventListener('click', ackBackup);
 for (const btn of document.querySelectorAll('.tab-btn')) {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 }
+for (const btn of document.querySelectorAll('.chart-metric-btn')) {
+  btn.addEventListener('click', () => selectChartMetric(btn.dataset.metric));
+}
+for (const btn of document.querySelectorAll('.range-btn')) {
+  btn.addEventListener('click', () => selectChartRange(btn.dataset.range));
+}
 
 // If a session cookie is already valid (page reload, or localhost bypass),
 // the status call succeeds immediately and skips the login screen. A 401
@@ -481,6 +682,7 @@ refresh().catch((err) => {
   if (err && err.status !== 401) showError(err.message || String(err));
 });
 refreshPosts();
+refreshChart();
 `;
 }
 

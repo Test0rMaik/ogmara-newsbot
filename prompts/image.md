@@ -21,7 +21,9 @@ about the image attached to this message.
 - `title` — a short, plain-text caption. No markdown, no surrounding quotes.
   Keep it under {{MAX_TITLE_BYTES}} bytes.
 - `content` — around {{TARGET_CONTENT_CHARS}} characters of markdown. For most
-  images one short paragraph is plenty; do not pad.
+  images one short paragraph is plenty; do not pad. If it does run longer,
+  separate distinct ideas with a real blank line rather than one unbroken
+  block.
 - `tags` — up to {{MAX_TAGS}} tags describing the subject matter, lowercase, no
   leading `#`. Prefer what is depicted (`architecture`, `coastline`, `winter`)
   over generic ones like `photo` or `image`.

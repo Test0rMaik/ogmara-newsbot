@@ -109,6 +109,74 @@ export function stripHtml(html: string): string {
     .trim();
 }
 
+/**
+ * Find the first URL attribute among a node's occurrences (single object or
+ * array), optionally filtered by a predicate over each candidate's own
+ * attributes.
+ */
+function firstAttr(
+  value: unknown,
+  attr: string,
+  predicate?: (obj: Record<string, unknown>) => boolean,
+): string | undefined {
+  for (const raw of asArray(value as unknown[] | undefined)) {
+    if (raw === null || typeof raw !== 'object') continue;
+    const obj = raw as Record<string, unknown>;
+    if (predicate !== undefined && !predicate(obj)) continue;
+    const attrValue = obj[attr];
+    if (typeof attrValue === 'string' && attrValue.trim().length > 0) return attrValue.trim();
+  }
+  return undefined;
+}
+
+/** True when a media-namespace `@_type`/`@_medium` pair describes an image. */
+function isImageMedia(obj: Record<string, unknown>): boolean {
+  if (obj['@_medium'] === 'image') return true;
+  const type = obj['@_type'];
+  return typeof type === 'string' && type.startsWith('image/');
+}
+
+/**
+ * Pull an illustrative image URL out of an RSS item, checked in the order
+ * real-world feeds most commonly provide them: Media RSS's `<media:content>`
+ * (news aggregators), `<media:thumbnail>` (Reddit and others), then the
+ * plain RSS 2.0 `<enclosure>`. Returns undefined rather than guessing when a
+ * feed provides none — an absent image is normal, not an error.
+ */
+function rssItemImageUrl(item: Record<string, unknown>): string | undefined {
+  return (
+    firstAttr(item['media:content'], '@_url', isImageMedia) ??
+    firstAttr(item['media:thumbnail'], '@_url') ??
+    firstAttr(item['enclosure'], '@_url', isImageMedia)
+  );
+}
+
+/**
+ * Pull an illustrative image URL out of an Atom entry: a `<link>` whose
+ * `rel="enclosure"` and whose `type` declares an image.
+ */
+function atomEntryImageUrl(entry: Record<string, unknown>): string | undefined {
+  return firstAttr(entry['link'], '@_href', (obj) => obj['@_rel'] === 'enclosure' && isImageMedia(obj));
+}
+
+/**
+ * Resolve a possibly-relative or protocol-relative image URL against the
+ * item's own article link. Real feeds do both (`//cdn.example.com/pic.jpg`,
+ * `/media/pic.jpg`) — `http.ts`'s `fetchBytes` only ever accepts a fully
+ * qualified absolute URL, so without this, an otherwise-valid image was
+ * silently dropped rather than fetched. Returns undefined (rather than
+ * throwing) when there's nothing to resolve against, or the result still
+ * isn't a valid URL — same "no image" outcome as a feed providing none.
+ */
+function resolveImageUrl(raw: string | undefined, baseUrl: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  try {
+    return new URL(raw, baseUrl).toString();
+  } catch {
+    return undefined;
+  }
+}
+
 /** Extract the link from an Atom entry, which may have several `<link>` forms. */
 function atomLink(entry: Record<string, unknown>): string | undefined {
   const links = asArray(entry['link'] as unknown);
@@ -162,6 +230,7 @@ export function parseFeed(xml: string, fallbackPublisher?: string): Candidate[] 
       const guid = asText(item['guid']);
       const summaryRaw = asText(item['description']) ?? asText(item['content:encoded']);
       const publishedAt = parseDate(item['pubDate']) ?? parseDate(item['dc:date']);
+      const imageUrl = resolveImageUrl(rssItemImageUrl(item), url);
 
       out.push({
         dedupKey: candidateKey({
@@ -175,6 +244,7 @@ export function parseFeed(xml: string, fallbackPublisher?: string): Candidate[] 
         ...(url !== undefined ? { url } : {}),
         ...(publisher !== undefined ? { publisher } : {}),
         ...(publishedAt !== undefined ? { publishedAt } : {}),
+        ...(imageUrl !== undefined ? { imageUrl } : {}),
       });
     }
     return out;
@@ -192,6 +262,7 @@ export function parseFeed(xml: string, fallbackPublisher?: string): Candidate[] 
       const guid = asText(entry['id']);
       const summaryRaw = asText(entry['summary']) ?? asText(entry['content']);
       const publishedAt = parseDate(entry['published']) ?? parseDate(entry['updated']);
+      const imageUrl = resolveImageUrl(atomEntryImageUrl(entry), url);
 
       out.push({
         dedupKey: candidateKey({
@@ -205,6 +276,7 @@ export function parseFeed(xml: string, fallbackPublisher?: string): Candidate[] 
         ...(url !== undefined ? { url } : {}),
         ...(publisher !== undefined ? { publisher } : {}),
         ...(publishedAt !== undefined ? { publishedAt } : {}),
+        ...(imageUrl !== undefined ? { imageUrl } : {}),
       });
     }
     return out;

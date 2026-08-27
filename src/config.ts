@@ -141,6 +141,21 @@ const rssSourceSchema = z.object({
   timeoutMs: z.int().min(1000).max(120_000).default(20_000),
   /** Reject a feed response larger than this. Guards against a runaway feed. */
   maxBytes: z.int().min(1024).max(50 * 1024 * 1024).default(5 * 1024 * 1024),
+  /**
+   * Attach an item's own illustrative image (an RSS `<enclosure>`,
+   * `media:thumbnail`/`media:content`, or an Atom `rel="enclosure"` link),
+   * when the feed provides one. The image is downloaded and uploaded
+   * alongside the AI-written text; it is never shown to the AI provider.
+   *
+   * On by default, but a *best-effort* addition: a failed download or upload
+   * (dead link, oversized image, node's IPFS backend down) never blocks the
+   * post — the text still goes out without the image. See pipeline.ts.
+   */
+  fetchImages: z.boolean().default(true),
+  /** Skip an item's image if it's larger than this. Must stay at or below the node's cap. */
+  maxImageBytes: z.int().min(1024).max(50 * 1024 * 1024).default(8 * 1024 * 1024),
+  /** Per-image fetch timeout, separate from the feed's own `timeoutMs`. */
+  imageTimeoutMs: z.int().min(1000).max(120_000).default(20_000),
 });
 
 const topicsSourceSchema = z.object({
@@ -280,6 +295,28 @@ const storageSchema = z.object({
   ledgerPath: z.string().min(1).default('data/ledger.json'),
   /** Entries older than this are pruned. */
   retentionDays: z.int().min(1).max(3650).default(90),
+});
+
+/**
+ * Periodic engagement snapshots, feeding the dashboard's reactions/reposts/
+ * comments history chart. Only meaningful when `panel.enabled` — nothing
+ * else reads this data — so the scheduler in `index.ts` skips it entirely
+ * when the panel is off, regardless of this `enabled` flag.
+ */
+const statsSchema = z.object({
+  enabled: z.boolean().default(true),
+  schedule: z
+    .string()
+    .default('0 */6 * * *')
+    .refine(isValidCron, { message: 'not a valid cron expression' }),
+  /** Where the snapshot history lives. */
+  path: z.string().min(1).default('data/stats-history.json'),
+  /** Snapshots older than this are pruned. */
+  retentionDays: z.int().min(1).max(3650).default(730),
+  /** Page size used while paginating through the full post history to build one snapshot. */
+  pageSize: z.int().min(1).max(200).default(100),
+  /** Safety cap on how many posts one snapshot will scan, regardless of how many the node reports. */
+  maxPostsScanned: z.int().min(1).max(50_000).default(2000),
 });
 
 /**
@@ -430,6 +467,7 @@ const configSchema = z.object({
   queue: queueSchema.prefault({}),
   storage: storageSchema.prefault({}),
   panel: panelSchema.prefault({}),
+  stats: statsSchema.prefault({}),
 });
 
 /** Fully validated bot configuration (secrets excluded). */

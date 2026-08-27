@@ -5,6 +5,140 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-08-27
+
+Feedback from the first real day of live posting: an illustrative image on
+feed posts, more readable post bodies, a wider dashboard with links out to
+each post, and a real reactions/reposts/comments history chart.
+
+### Added
+
+- **RSS feed images.** When a feed item carries its own illustrative image
+  (an `<enclosure>`, `media:thumbnail`/`media:content`, or an Atom
+  `rel="enclosure"` link), the bot now downloads and attaches it alongside
+  the AI-written text — `sources.rss.fetchImages` (default `true`). It is
+  decorative only: never shown to the AI model, and best-effort — a dead
+  link, an oversized image, or the node's IPFS backend being down costs the
+  image, never the post. The download goes through the same bounded,
+  SSRF-checked fetch path (`http.ts`'s new `fetchBytes`) as every other
+  feed-derived value, since the URL comes from the same untrusted feed as
+  the title and summary.
+- **More readable post bodies.** All three prompts (`prompts/news.md`,
+  `topic.md`, `image.md`) now explicitly ask for real blank-line-separated
+  paragraphs, breaking wherever the topic shifts, instead of "one or two
+  short paragraphs" with no guidance on how to actually break them — the
+  client already turns `\n\n` into a visible gap (verified against
+  `web/src/lib/FormattedText.tsx`), so the wall-of-text look on the first
+  live post was a prompt gap, not a rendering one.
+- **Dashboard: engagement history chart.** New first section of the
+  Dashboard tab — a line chart of reactions, reposts, and comments (switch
+  metric via its own tabs; time range via Monthly/Yearly/Overall), built
+  from periodic snapshots the bot takes of the account's full-history totals
+  (`stats:` in the config, default every 6 hours). Needs at least two
+  snapshots before it shows anything, so a freshly enabled panel shows an
+  empty chart for one interval. Hand-rolled SVG, no charting library.
+- **Dashboard: post links.** Each recent post now links to its live page on
+  ogmara.org (`https://ogmara.org/app/#/news/<msgId>`), opened in a new tab.
+- **Dashboard: wider layout.** 80% of the screen width (was a fixed 640px
+  column) — the chart in particular needed the room.
+
+### Changed
+
+- `panel/posts.ts`'s `sumReactionCounts` is now exported and shared with the
+  new `stats.ts`, rather than duplicated — one place enforces "reject
+  non-finite/negative reaction counts from the node."
+
+### Security
+
+Found by the mandatory code/security audit pass on this release. The two
+HIGH findings are one coherent gap: a hostile RSS feed could choose *where*
+the bot fetched from and *what* it published under the operator's wallet —
+both closed before this shipped.
+
+- **SSRF: feed content, not just the feed URL, now chooses the fetch
+  destination — and the loopback/private-address blocklist had verified
+  gaps.** Adding feed images meant `fetchBytes`'s URL argument became
+  attacker-influenceable (an `<enclosure>`/`media:thumbnail` value from the
+  feed itself, not the operator-configured feed URL), which changes the
+  threat model `http.ts`'s blocklist was written under. Verified bypasses,
+  reachable with no redirect needed: IPv4-mapped IPv6 addresses in their hex
+  form (`http://[::ffff:127.0.0.1]/` normalizes to hostname
+  `[::ffff:7f00:1]`, which matched none of the dotted-quad-only patterns),
+  the IPv6 unspecified address (`[::]`), IPv6 link-local (`fe80::/10`, the
+  169.254/16 equivalent), and CGNAT (`100.64.0.0/10`). A hostile feed item
+  could point at the operator's own LAN — including this bot's own panel or
+  the l2-node admin API — and if the target answered with an `image/*`
+  Content-Type, the response body would be uploaded to IPFS and published,
+  not just probed blind. All five gaps are closed in
+  `assertFetchableUrl`/`BLOCKED_HOST_PATTERNS`.
+- **A hostile feed server's `Content-Type` header alone decided whether
+  something was "an image."** The only check was `mimeType.startsWith('image/')`
+  against a header the *remote server itself* writes — no verification
+  against the actual bytes. A feed server could label arbitrary content
+  (malware, anything) `image/png` and have it pinned to IPFS and published
+  under the operator's wallet to an unretractable feed with no human in the
+  loop, or label a script-capable SVG as an image and have it attached.
+  `media.ts` now allowlists exactly the four raster types `imagedir.ts`
+  already supported (jpeg/png/gif/webp — `svg+xml` is no longer accepted at
+  all) and verifies the bytes' real magic-number signature against the
+  claimed type before anything is validated or uploaded, on both the
+  path-based (imagedir) and bytes-based (RSS feed) code paths.
+- **Full post history aggregation (for the new engagement chart) had no
+  wall-clock deadline**, and now runs unattended — once at startup and on
+  its own cron — rather than only when an operator has the dashboard open.
+  A stalling or malicious node could keep one aggregation pass running
+  indefinitely even with `maxPostsScanned` capping request *count*.
+  `aggregateAllPostStats` now also stops after a wall-clock deadline
+  (60s default). The startup snapshot and the first cron tick could also
+  race and run concurrently; a simple in-flight guard in `index.ts` prevents
+  the overlap.
+- A feed-supplied title reached `console.warn` unsanitized in the new
+  image-skip warning, unlike every other feed-derived string this project
+  logs — could forge terminal/log lines via embedded ANSI escapes. Now
+  passed through the existing `stripControlSequences` (moved from `index.ts`
+  to its own `terminal.ts` module so `pipeline.ts` can use it without a
+  circular import).
+
+### Fixed
+
+Also found by the audit pass, not exploitable by a remote feed but real
+correctness/data-integrity bugs in the new dashboard-history feature:
+
+- **`statsHistory.ts` could silently destroy up to `retentionDays` (730 by
+  default) of real history on a transient disk read error** (permissions,
+  file-descriptor pressure, an NFS hiccup) — it was treated the same as
+  genuine file corruption ("start fresh"), and the very next snapshot then
+  overwrote the file with just that one new point, within seconds of boot
+  since a snapshot fires immediately on startup. Reproduced: 500 real
+  snapshots on disk, a permissions error, one `append()` → 1 survives. Now
+  an unreadable-for-unknown-reasons file puts the instance in read-only mode
+  (the chart is empty for that run; the file on disk is never touched, so a
+  clean restart recovers everything), while genuine corruption is renamed
+  aside (`.corrupt-<timestamp>`) instead of just discarded, so it's
+  actually inspectable.
+- A single non-finite (`NaN`/`Infinity`) `repost_count`, `comment_count`, or
+  lifetime post total from the node — possible via msgpack, unlike JSON —
+  rendered the **entire** history chart blank for every metric and every
+  time range, silently, with no error shown. `stats.ts` now rejects
+  non-finite/negative values on every aggregated field, matching the
+  existing (correct) handling `sumReactionCounts` already had.
+- The stats-history file had no cap on snapshot *count*, only age
+  (`retentionDays`) — a short `stats.schedule` combined with a long
+  retention window could grow it and the `/api/stats-history` response
+  without bound. Capped at 5000 snapshots regardless of age.
+- The chart's SVG used a fixed `viewBox` against a variable-width container,
+  non-uniformly stretching the line and smearing the text labels on any
+  screen wider than 600px (which, after this release's own width change, is
+  most of them). Now matches the viewBox to the SVG's actual rendered width
+  each render, so there is no distortion.
+- `refreshChart`'s error path could leave a stale chart or the "not enough
+  history yet" text showing at the same time as the error message,
+  contradicting it. Now clears both on failure.
+- Protocol-relative (`//cdn.example.com/pic.jpg`) and site-relative
+  (`/media/pic.jpg`) feed image URLs — both common in real feeds — were
+  silently dropped rather than resolved, since `new URL()` requires an
+  absolute URL. Now resolved against the item's own article link.
+
 ## [0.10.0] - 2026-08-27
 
 A dashboard tab for the control panel, and three fixes for things reported

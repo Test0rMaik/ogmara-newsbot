@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AiProvider, ComposeResult } from './ai/index.js';
 import type { Config } from './config.js';
 import { Ledger } from './ledger.js';
@@ -36,6 +36,9 @@ const CONFIG = {
     maxTags: 5,
     maxSourceTitleChars: 500,
     maxSourceSummaryChars: 4000,
+  },
+  sources: {
+    rss: { fetchImages: true, maxImageBytes: 1024 * 1024, imageTimeoutMs: 5000 },
   },
 } as unknown as Config;
 
@@ -92,10 +95,17 @@ const OK_RESULT: ComposeResult = {
   tags: ['central-banking', 'rates'],
 };
 
-function publisherStub(result: PublishResult): { pub: OgmaraPublisher; sent: ComposedPost[] } {
+function publisherStub(
+  result: PublishResult,
+  client?: unknown,
+): { pub: OgmaraPublisher; sent: ComposedPost[] } {
   const sent: ComposedPost[] = [];
   const pub = {
     address: 'klv1test',
+    // Present so `pipeline.ts`'s image-upload path has something to call;
+    // a test that shouldn't reach it (dry run, no imageUrl) never touches
+    // this, and one that should passes its own `client`.
+    client: client ?? { uploadMedia: async () => { throw new Error('unexpected upload'); } },
     publish: async (post: ComposedPost): Promise<PublishResult> => {
       sent.push(post);
       return result;
@@ -307,6 +317,160 @@ describe('composeWithAi — source routing', () => {
     await composeWithAi(candidate(), CONFIG, provider, TEMPLATES);
     expect(prompts[0]).toContain('UNTRUSTED_SOURCE');
     expect(images).toEqual([]);
+  });
+});
+
+describe('runOnce — RSS feed images (best-effort, never blocks the post)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubFetch(routes: Record<string, () => Response | Promise<Response>>): void {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        const handler = routes[url];
+        if (!handler) throw new Error(`unexpected fetch to ${url}`);
+        return handler();
+      }),
+    );
+  }
+
+  it('attaches the downloaded image on a live publish', async () => {
+    // Real JPEG magic bytes: media.ts now verifies the actual signature
+    // against the claimed Content-Type rather than trusting the header
+    // alone (security audit, 0.11.0) — a fixture claiming image/jpeg has to
+    // actually look like one.
+    const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2]);
+    stubFetch({
+      'https://cdn.example.com/pic.jpg': () =>
+        new Response(jpegBytes, { status: 200, headers: { 'content-type': 'image/jpeg' } }),
+    });
+    let uploadedFilename = '';
+    const { pub, sent } = publisherStub({ status: 'published', msgId: 'abc' }, {
+      uploadMedia: async (blob: Blob, filename: string) => {
+        uploadedFilename = filename;
+        return { cid: 'bafy-1', size: blob.size };
+      },
+    });
+    const d = deps({
+      sources: [sourceOf(candidate({ imageUrl: 'https://cdn.example.com/pic.jpg' }))],
+      publisher: pub,
+    });
+    const outcome = await runOnce(d);
+    expect(outcome.status).toBe('posted');
+    expect(sent[0]!.attachments).toEqual([
+      { cid: 'bafy-1', mime_type: 'image/jpeg', size_bytes: jpegBytes.byteLength, filename: 'feed-image.jpg' },
+    ]);
+    expect(uploadedFilename).toBe('feed-image.jpg');
+  });
+
+  it('attaches a dry-run placeholder without ever calling uploadMedia', async () => {
+    const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    stubFetch({
+      'https://cdn.example.com/pic.png': () =>
+        new Response(pngBytes, { status: 200, headers: { 'content-type': 'image/png' } }),
+    });
+    const d = deps({
+      config: { ...CONFIG, posting: { ...CONFIG.posting, dryRun: true } } as Config,
+      sources: [sourceOf(candidate({ imageUrl: 'https://cdn.example.com/pic.png' }))],
+      publisher: publisherStub({ status: 'dry-run' }).pub,
+    });
+    const outcome = await runOnce(d);
+    expect(outcome.status).toBe('dry-run');
+    expect(outcome.status === 'dry-run' && outcome.post.attachments).toEqual([
+      {
+        cid: 'dry-run-not-uploaded',
+        mime_type: 'image/png',
+        size_bytes: pngBytes.byteLength,
+        filename: 'feed-image.png',
+      },
+    ]);
+  });
+
+  it('still publishes the text-only post when the image bytes do not match the claimed Content-Type', async () => {
+    // A hostile feed server could label anything image/jpeg; the magic-byte
+    // check rejects it, and — same graceful-degradation contract as every
+    // other image failure — the text post still goes out.
+    stubFetch({
+      'https://cdn.example.com/lying.jpg': () =>
+        new Response(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), {
+          status: 200,
+          headers: { 'content-type': 'image/jpeg' },
+        }),
+    });
+    const d = deps({ sources: [sourceOf(candidate({ imageUrl: 'https://cdn.example.com/lying.jpg' }))] });
+    const outcome = await runOnce(d);
+    expect(outcome.status).toBe('posted');
+  });
+
+  it('still publishes the text-only post when the image fetch fails', async () => {
+    // The core behavior this whole block exists to prove: an RSS item's own
+    // image is decorative, not the point of the post the way it is for
+    // imagedir — a dead link must cost the image, never the post.
+    stubFetch({
+      'https://cdn.example.com/missing.jpg': () => new Response('not found', { status: 404 }),
+    });
+    const d = deps({ sources: [sourceOf(candidate({ imageUrl: 'https://cdn.example.com/missing.jpg' }))] });
+    const outcome = await runOnce(d);
+    expect(outcome.status).toBe('posted');
+  });
+
+  it('still publishes when the image exceeds maxImageBytes', async () => {
+    stubFetch({
+      'https://cdn.example.com/huge.jpg': () =>
+        new Response(new Uint8Array(2 * 1024 * 1024), {
+          status: 200,
+          headers: { 'content-type': 'image/jpeg' },
+        }),
+    });
+    const d = deps({ sources: [sourceOf(candidate({ imageUrl: 'https://cdn.example.com/huge.jpg' }))] });
+    const outcome = await runOnce(d);
+    expect(outcome.status).toBe('posted');
+  });
+
+  it('still publishes when the node rejects the upload (e.g. IPFS backend down)', async () => {
+    stubFetch({
+      'https://cdn.example.com/pic.jpg': () =>
+        new Response(new Uint8Array([0xff, 0xd8, 0xff, 1, 2]), {
+          status: 200,
+          headers: { 'content-type': 'image/jpeg' },
+        }),
+    });
+    const { pub, sent } = publisherStub({ status: 'published', msgId: 'abc' }, {
+      uploadMedia: async () => {
+        throw new Error('request failed: 503');
+      },
+    });
+    const d = deps({
+      sources: [sourceOf(candidate({ imageUrl: 'https://cdn.example.com/pic.jpg' }))],
+      publisher: pub,
+    });
+    const outcome = await runOnce(d);
+    expect(outcome.status).toBe('posted');
+    expect(sent[0]!.attachments).toBeUndefined();
+  });
+
+  it('never fetches anything when the candidate has no imageUrl', async () => {
+    const spy = vi.fn();
+    vi.stubGlobal('fetch', spy);
+    const d = deps(); // default candidate() has no imageUrl
+    await runOnce(d);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('never fetches when sources.rss.fetchImages is disabled', async () => {
+    const spy = vi.fn();
+    vi.stubGlobal('fetch', spy);
+    const d = deps({
+      config: {
+        ...CONFIG,
+        sources: { rss: { ...CONFIG.sources.rss, fetchImages: false } },
+      } as Config,
+      sources: [sourceOf(candidate({ imageUrl: 'https://cdn.example.com/pic.jpg' }))],
+    });
+    await runOnce(d);
+    expect(spy).not.toHaveBeenCalled();
   });
 });
 

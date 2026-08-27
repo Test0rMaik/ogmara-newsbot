@@ -91,6 +91,15 @@ sources:
     timeoutMs: 20000
     maxBytes: 5242880
 
+    # Attach an item's own illustrative image when the feed provides one (an
+    # RSS <enclosure>, media:thumbnail/media:content, or an Atom rel="enclosure"
+    # link) — decorative, never shown to the AI model. Best-effort: a dead
+    # link, an oversized image, or the node's IPFS backend being down costs
+    # the image, never the post.
+    fetchImages: true
+    maxImageBytes: 8388608       # 8 MB — must stay at or below your node's upload cap
+    imageTimeoutMs: 20000
+
     # `publisher` overrides the name taken from the feed's own title, and is
     # what appears in the post's attribution line.
     feeds:
@@ -269,3 +278,27 @@ panel:
   # panel with something that proxies to it WITHOUT ever setting that header,
   # which is otherwise invisible to the bot.
   requireLogin: false
+
+stats:
+  # Periodic engagement snapshots, feeding the dashboard's reactions/reposts/
+  # comments history chart (panel.enabled must also be true — nothing else
+  # reads this data). The node has no history endpoint of its own, so this is
+  # built by periodically walking the bot's full post history and recording
+  # one point; there is no way to backfill history from before this was
+  # first turned on.
+  enabled: true
+
+  # How often to take a snapshot. Independent of your posting schedule.
+  schedule: "0 */6 * * *"       # every 6 hours
+
+  # Where the snapshot history lives.
+  path: data/stats-history.json
+
+  # Snapshots older than this are pruned on save.
+  retentionDays: 730             # ~2 years
+
+  # Page size used while paginating through your full post history to build
+  # one snapshot, and a safety cap on how many posts one snapshot will scan
+  # regardless of how many the node reports.
+  pageSize: 100
+  maxPostsScanned: 2000

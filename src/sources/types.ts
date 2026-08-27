@@ -35,6 +35,15 @@ export interface Candidate {
   imagePath?: string;
   /** MIME type of {@link imagePath}. */
   imageMimeType?: string;
+  /**
+   * URL of an illustrative image found alongside the item — an RSS
+   * `<enclosure>`, `media:thumbnail`/`media:content`, or an Atom `rel="enclosure"`
+   * link. Unlike {@link imagePath} this is remote and untrusted: it comes from
+   * the same feed as `title`/`summary`, so fetching it goes through the same
+   * bounded, SSRF-checked path (`http.ts`'s `fetchBytes`) as everything else
+   * pulled from a feed.
+   */
+  imageUrl?: string;
 }
 
 /** A configured, pollable source. */

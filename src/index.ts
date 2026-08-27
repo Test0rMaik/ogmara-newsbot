@@ -9,7 +9,7 @@
 
 import { statSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
-import { WalletSigner } from '@ogmara/sdk';
+import { WalletSigner, type OgmaraClient } from '@ogmara/sdk';
 import { config as loadDotenv } from 'dotenv';
 import { AiConfigError, createProvider } from './ai/index.js';
 import { loadTemplate } from './ai/prompt.js';
@@ -41,6 +41,9 @@ import { ImageDirSource } from './sources/imagedir.js';
 import { RssSource } from './sources/rss.js';
 import { TopicsSource } from './sources/topics.js';
 import type { Source } from './sources/types.js';
+import { aggregateAllPostStats } from './stats.js';
+import { StatsHistory } from './statsHistory.js';
+import { stripControlSequences } from './terminal.js';
 import { WALLET_BACKUP_PATH, acknowledgeBackup, isBackupPending } from './walletBackup.js';
 
 interface CliArgs {
@@ -133,28 +136,6 @@ Secrets come from the environment (or a .env file), never the config file:
 
 Note: --dry-run can only ever make the bot safer. Live posting requires
 setting posting.dryRun: false in the config file, deliberately.`;
-
-/**
- * Strip terminal control sequences from text before printing it.
- *
- * Anything derived from a feed or from AI output can carry ANSI escapes. That
- * matters here more than in most CLIs: dry-run review is this project's stated
- * primary safety control, and an attacker who can repaint the pane could show
- * the operator a benign post while a different one is what publishes. Removes
- * C0/C1 controls (keeping \n and \t) and CSI/OSC sequences.
- * (Audit 2026-08-26, SEC-W7.)
- */
-export function stripControlSequences(text: string): string {
-  return (
-    text
-      // OSC: ESC ] ... terminated by BEL or ST (ESC \\)
-      .replace(/\u001B\][\s\S]*?(?:\u0007|\u001B\\)/g, '')
-      // CSI and other ESC-introduced sequences
-      .replace(/\u001B[@-_][0-?]*[ -/]*[@-~]?/g, '')
-      // Bare C0 controls except \t and \n, plus DEL and the C1 range
-      .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, '')
-  );
-}
 
 /**
  * Warn when `.env` is readable by anyone but its owner.
@@ -537,8 +518,12 @@ async function run(args: CliArgs): Promise<number> {
   // The panel only makes sense for a long-running instance — `--once` exits
   // immediately, which would start a server nobody could ever reach.
   let panel: Panel | undefined;
+  // Loaded only when the panel is on: it's the only consumer, per
+  // config.ts's statsSchema comment.
+  let statsHistory: StatsHistory | undefined;
   if (effective.panel.enabled) {
-    panel = await startControlPanel(effective, secrets, publisher, queue);
+    statsHistory = StatsHistory.load(effective.stats.path, effective.stats.retentionDays);
+    panel = await startControlPanel(effective, secrets, publisher, queue, statsHistory);
   }
 
   // One job per enabled source, each on its own cron. They share the run
@@ -563,6 +548,45 @@ async function run(args: CliArgs): Promise<number> {
     });
     jobs.push(job);
     console.log(`Schedule: ${name} "${cron}" — next ${job.nextRun()?.toISOString() ?? 'never'}`);
+  }
+
+  // The dashboard's history chart, not the posting pipeline — a separate
+  // cron entirely, so its cadence (and whether it runs at all) is
+  // independent of how often the bot actually posts.
+  if (statsHistory !== undefined && effective.stats.enabled) {
+    const history = statsHistory;
+    // The scheduler's own overlap guard (scheduler.ts's `running` flag) only
+    // covers cron ticks — it can't see the one-off startup snapshot below,
+    // so without this a slow first aggregation pass could still be running
+    // when the first cron tick fires, doubling node load for no benefit
+    // (two near-simultaneous snapshots of the same totals). (Code audit,
+    // 0.11.0.)
+    let snapshotInFlight = false;
+    const takeSnapshot = async (): Promise<void> => {
+      if (snapshotInFlight) return;
+      snapshotInFlight = true;
+      try {
+        await takeStatsSnapshot(publisher.client, publisher.address, history, effective.stats);
+      } finally {
+        snapshotInFlight = false;
+      }
+    };
+    // Fire one immediately rather than waiting for the first cron tick — a
+    // freshly enabled panel would otherwise show an empty chart for up to a
+    // full `stats.schedule` interval (6 hours, by default) with nothing
+    // explaining why. Not awaited: a full history walk shouldn't hold up
+    // startup, and a failure here is logged, never fatal.
+    void takeSnapshot().catch((err) => {
+      console.warn(`  warning: initial stats snapshot failed: ${err instanceof Error ? err.message : err}`);
+    });
+    const job = schedule(effective.stats.schedule, async () => {
+      try {
+        await takeSnapshot();
+      } catch (err) {
+        console.warn(`  warning: stats snapshot failed: ${err instanceof Error ? err.message : err}`);
+      }
+    });
+    jobs.push(job);
   }
 
   // A schedule controls WHEN the bot attempts a post; posting.maxPostsPerHour
@@ -612,6 +636,22 @@ async function run(args: CliArgs): Promise<number> {
   return 0;
 }
 
+/** Aggregate current engagement totals and append one snapshot to the history. */
+async function takeStatsSnapshot(
+  client: OgmaraClient,
+  address: string,
+  history: StatsHistory,
+  statsConfig: Config['stats'],
+): Promise<void> {
+  const agg = await aggregateAllPostStats(
+    (addr, options) => client.getUserPosts(addr, options),
+    address,
+    statsConfig.pageSize,
+    statsConfig.maxPostsScanned,
+  );
+  history.append({ timestamp: Date.now(), ...agg });
+}
+
 /**
  * Start the control panel, translating config validation errors and bind
  * failures into the same "fail loudly at startup" style as the rest of `run`.
@@ -621,6 +661,7 @@ async function startControlPanel(
   secrets: Secrets,
   publisher: OgmaraPublisher,
   queue: PostQueue,
+  statsHistory: StatsHistory,
 ): Promise<Panel> {
   let trustedProxies: TrustedProxies;
   try {
@@ -667,6 +708,7 @@ async function startControlPanel(
         DASHBOARD_POST_LIMIT,
       ),
     queuedCountFn: () => queue.size,
+    fetchStatsHistory: () => Promise.resolve(statsHistory.all()),
   });
 
   console.log(

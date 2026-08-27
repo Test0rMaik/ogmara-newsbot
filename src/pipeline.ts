@@ -16,8 +16,10 @@ import { capText, fenceUntrusted, loadTemplate, newFenceMarker, renderTemplate }
 import type { Config } from './config.js';
 import { isNearDuplicate } from './dedup.js';
 import { buildTags } from './hashtags.js';
+import { fetchBytes } from './http.js';
 import { Ledger } from './ledger.js';
-import { uploadImage, validateImageOnly } from './media.js';
+import { uploadImage, uploadImageBytes, validateImageBytesOnly, validateImageOnly } from './media.js';
+import { stripControlSequences } from './terminal.js';
 import { MAX_TITLE_BYTES, type ComposedPost, type OgmaraPublisher } from './ogmara.js';
 import type { PostQueue } from './queue.js';
 import { readFileSync } from 'node:fs';
@@ -77,6 +79,24 @@ export function truncateTitle(title: string, maxBytes = MAX_TITLE_BYTES): string
   if (lastSpace > out.length * 0.6) out = out.slice(0, lastSpace);
 
   return `${out.trimEnd()}${ELLIPSIS}`;
+}
+
+/**
+ * Image MIME types to their conventional extension, for a cosmetic filename.
+ * Deliberately only the types `media.ts`'s allowlist actually accepts —
+ * anything else is rejected there anyway (by design: excludes formats like
+ * SVG, which is script-capable), so there's no point building a filename for
+ * one.
+ */
+const IMAGE_EXTENSIONS: Readonly<Record<string, string>> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+};
+
+function extensionForMimeType(mimeType: string): string {
+  return IMAGE_EXTENSIONS[mimeType] ?? '';
 }
 
 /** Build the tag list an operator's config demands, ahead of AI suggestions. */
@@ -379,6 +399,43 @@ export async function runOnce(deps: PipelineDeps): Promise<RunOutcome> {
         ledger.record({ key: fresh.dedupKey, title: fresh.title, postedAt: now(), kind: fresh.kind });
       }
       return { status: 'compose-failed', title: fresh.title, reason };
+    }
+  }
+
+  // An RSS item's own illustrative image is best-effort, unlike imagedir's
+  // (above): there the image IS the post and a failure must block it; here
+  // the AI-written text stands on its own, so a dead link, an oversized
+  // image, or the node's IPFS backend being down should cost the image, not
+  // the post. Never fed to the AI provider — this is a decorative attachment
+  // fetched after composition, not vision input.
+  if (
+    fresh.kind === 'rss' &&
+    fresh.imageUrl !== undefined &&
+    config.sources.rss.fetchImages &&
+    post.attachments === undefined
+  ) {
+    try {
+      const { bytes, contentType } = await fetchBytes(fresh.imageUrl, {
+        timeoutMs: config.sources.rss.imageTimeoutMs,
+        maxBytes: config.sources.rss.maxImageBytes,
+      });
+      const mimeType = contentType?.split(';')[0]?.trim() ?? '';
+      const filename = 'feed-image' + extensionForMimeType(mimeType);
+      const attachment = config.posting.dryRun
+        ? validateImageBytesOnly(bytes, filename, mimeType, config.sources.rss.maxImageBytes)
+        : await uploadImageBytes(
+            publisher.client,
+            bytes,
+            filename,
+            mimeType,
+            config.sources.rss.maxImageBytes,
+          );
+      post.attachments = [attachment];
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `  skipping feed image for "${stripControlSequences(fresh.title).slice(0, 60)}": ${reason}`,
+      );
     }
   }
 

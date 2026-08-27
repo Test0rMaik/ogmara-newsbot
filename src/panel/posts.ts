@@ -162,7 +162,7 @@ function decodePayload(payload: unknown): { title?: string | undefined; tags?: s
  * Rejecting non-finite/negative values stops a bad node turning this into
  * `Infinity` or `NaN` on the dashboard.
  */
-function sumReactionCounts(value: unknown): number {
+export function sumReactionCounts(value: unknown): number {
   if (typeof value !== 'object' || value === null) return 0;
   let total = 0;
   for (const count of Object.values(value as Record<string, unknown>)) {

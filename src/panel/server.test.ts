@@ -70,6 +70,7 @@ interface StartOptions {
   walletBackupPending?: boolean;
   fetchPostStats?: PanelDeps['fetchPostStats'];
   queuedCount?: number;
+  fetchStatsHistory?: PanelDeps['fetchStatsHistory'];
 }
 
 async function start(options: StartOptions = {}): Promise<{
@@ -82,6 +83,7 @@ async function start(options: StartOptions = {}): Promise<{
     registerWallet: ReturnType<typeof vi.fn>;
     acknowledgeWalletBackup: ReturnType<typeof vi.fn>;
     fetchPostStats: ReturnType<typeof vi.fn>;
+    fetchStatsHistory: ReturnType<typeof vi.fn>;
   };
 }> {
   const auth = new PanelAuth({
@@ -123,6 +125,8 @@ async function start(options: StartOptions = {}): Promise<{
       })),
   );
 
+  const fetchStatsHistoryFn = vi.fn(options.fetchStatsHistory ?? (async () => []));
+
   const deps: PanelDeps = {
     auth,
     trustedProxies: new TrustedProxies(options.trustedProxyCidrs ?? []),
@@ -143,6 +147,7 @@ async function start(options: StartOptions = {}): Promise<{
     acknowledgeWalletBackup: acknowledgeWalletBackupFn,
     fetchPostStats: fetchPostStatsFn,
     queuedCountFn: () => options.queuedCount ?? 0,
+    fetchStatsHistory: fetchStatsHistoryFn,
   };
 
   const started = await startPanel('127.0.0.1', 0, deps);
@@ -157,6 +162,7 @@ async function start(options: StartOptions = {}): Promise<{
       registerWallet: registerWalletFn,
       acknowledgeWalletBackup: acknowledgeWalletBackupFn,
       fetchPostStats: fetchPostStatsFn,
+      fetchStatsHistory: fetchStatsHistoryFn,
     },
   };
 }
@@ -700,6 +706,47 @@ describe('/api/posts', () => {
     const res = await fetch(`${baseUrl}/api/posts`);
     expect(res.status).toBe(200);
     expect(fns.fetchPostStats).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('/api/stats-history', () => {
+  it('returns the snapshots from fetchStatsHistory', async () => {
+    const { baseUrl } = await start({
+      fetchStatsHistory: async () => [
+        { timestamp: 1_700_000_000_000, totalReactions: 5, totalReposts: 2, totalComments: 1, totalPosts: 3 },
+      ],
+    });
+    const res = await fetch(`${baseUrl}/api/stats-history`);
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.snapshots).toHaveLength(1);
+    expect(body.snapshots[0].totalReactions).toBe(5);
+  });
+
+  it('maps a fetch failure to 502 rather than crashing', async () => {
+    const { baseUrl } = await start({
+      fetchStatsHistory: async () => {
+        throw new Error('disk read failed');
+      },
+    });
+    const res = await fetch(`${baseUrl}/api/stats-history`);
+    expect(res.status).toBe(502);
+  });
+
+  it('requires authentication for a non-local caller', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/stats-history`, {
+      headers: { 'X-Forwarded-For': '203.0.113.9' },
+    });
+    expect(res.status).toBe(401);
+    expect(fns.fetchStatsHistory).not.toHaveBeenCalled();
+  });
+
+  it('allows the localhost bypass, same as every other read route', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/stats-history`);
+    expect(res.status).toBe(200);
+    expect(fns.fetchStatsHistory).toHaveBeenCalledTimes(1);
   });
 });
 

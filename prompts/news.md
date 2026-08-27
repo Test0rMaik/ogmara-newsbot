@@ -36,8 +36,11 @@ Publisher: {{PUBLISHER}}
 
 - `title` — a clear headline, plain text, no markdown, no surrounding quotes.
   Keep it under {{MAX_TITLE_BYTES}} bytes.
-- `content` — around {{TARGET_CONTENT_CHARS}} characters of markdown. One or
-  two short paragraphs is usually right.
+- `content` — around {{TARGET_CONTENT_CHARS}} characters of markdown. Break it
+  into short paragraphs (roughly 2-4 sentences each) separated by a blank
+  line — a real blank line in the string, not just a visual wrap. Even a
+  short post should have a break wherever the topic shifts (e.g. what
+  happened, then why it matters). Never write it as one unbroken block.
 - `tags` — up to {{MAX_TAGS}} topic tags, lowercase, no leading `#`. Prefer
   specific topics (`central-banking`, `iceland`) over generic ones (`news`,
   `update`). Tags are how readers find the post, so choose what someone

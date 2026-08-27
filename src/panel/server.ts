@@ -16,6 +16,7 @@ import type { AddressInfo } from 'node:net';
 import type { OgmaraClient, ScNetwork, WalletSigner } from '@ogmara/sdk';
 import type { ProfileResult, ProfileSpec, RegisterResult, RegistrationStatus } from '../identity.js';
 import { REGISTRATION_COST_KLV } from '../klever.js';
+import type { StatsSnapshot } from '../statsHistory.js';
 import { PanelAuth } from './auth.js';
 import { TrustedProxies, isLoopback, resolveClientIp } from './clientip.js';
 import type { PostStats } from './posts.js';
@@ -79,6 +80,13 @@ export interface PanelDeps {
   fetchPostStats: () => Promise<PostStats>;
   /** How many composed posts are currently waiting on the local retry queue. */
   queuedCountFn: () => number;
+  /**
+   * Locally recorded engagement snapshots for the dashboard's history chart.
+   * Purely local data (see `statsHistory.ts`) — never fails against a remote
+   * source, but still async-shaped so a future implementation could change
+   * that without touching this interface.
+   */
+  fetchStatsHistory: () => Promise<readonly StatsSnapshot[]>;
 }
 
 /** Per-instance mutable state, kept out of PanelDeps because it isn't config. */
@@ -324,6 +332,18 @@ async function handle(
     } catch (err) {
       sendJson(res, 502, {
         error: `could not fetch posts: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+    return;
+  }
+
+  if (method === 'GET' && path === '/api/stats-history') {
+    try {
+      const snapshots = await deps.fetchStatsHistory();
+      sendJson(res, 200, { snapshots });
+    } catch (err) {
+      sendJson(res, 502, {
+        error: `could not fetch stats history: ${err instanceof Error ? err.message : String(err)}`,
       });
     }
     return;

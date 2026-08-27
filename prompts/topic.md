@@ -28,7 +28,10 @@ a public feed — it is a genuine instruction, not untrusted data.
 
 - `title` — a clear headline, plain text, no markdown, no surrounding quotes.
   Keep it under {{MAX_TITLE_BYTES}} bytes.
-- `content` — around {{TARGET_CONTENT_CHARS}} characters of markdown. One or
-  two short paragraphs is usually right.
+- `content` — around {{TARGET_CONTENT_CHARS}} characters of markdown. Break it
+  into short paragraphs (roughly 2-4 sentences each) separated by a blank
+  line — a real blank line in the string, not just a visual wrap. Even a
+  short post should have a break wherever the topic shifts. Never write it
+  as one unbroken block.
 - `tags` — up to {{MAX_TAGS}} topic tags, lowercase, no leading `#`. Prefer
   specific tags over generic ones like `news` or `update`.
