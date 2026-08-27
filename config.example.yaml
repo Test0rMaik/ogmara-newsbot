@@ -207,3 +207,58 @@ storage:
 
   # Entries older than this are pruned on save.
   retentionDays: 90
+
+panel:
+  # A small web UI for changing the bot's display name and registering its
+  # wallet on-chain, served alongside the normal scheduled runs (not used by
+  # --once). The bot ALWAYS signs with its own wallet (OGMARA_WALLET_KEY) —
+  # this never holds or asks for anyone else's key. adminWallets instead names
+  # the wallets allowed to log in and drive the bot's wallet, exactly like the
+  # l2-node dashboard's admin_wallets: an operator proves ownership by signing
+  # a one-time challenge with their own extension/K5, never by handing over a
+  # key.
+  enabled: false
+
+  # Loopback only by default: from 127.0.0.1 the panel needs no login at all
+  # (matching the l2-node dashboard's localhost bypass), which is enough for
+  # `ssh -L 8787:localhost:8787` tunnelling. Only widen this once adminWallets
+  # is set, or no one but localhost could ever get in.
+  bind: 127.0.0.1
+  port: 8787
+
+  # Wallets allowed to log in remotely. Leave empty for localhost-only access.
+  # adminWallets:
+  #   - klv1youroperatorwallet...
+
+  # How long a login session lasts before the operator must sign in again.
+  sessionTtlHours: 24
+
+  # If you put a reverse proxy (nginx, Apache, Caddy) in front of the panel,
+  # list ITS address here so the panel resolves the real remote client from
+  # X-Forwarded-For instead of treating the proxy itself as the client.
+  # Loopback is already trusted automatically — only list this when the proxy
+  # is NOT on localhost, e.g. running in a separate Docker container on the
+  # bridge network. Leave empty for a direct connection or a loopback proxy.
+  # Do NOT add addresses you do not control, or anyone able to reach the panel
+  # from there could forge this header and impersonate localhost.
+  # trustedProxies:
+  #   - 172.17.0.0/16
+
+  # Hostnames the panel will answer to, beyond the built-in localhost /
+  # 127.0.0.1 / ::1. Every request's Host header is checked against this list
+  # (this is what stops a malicious page from using DNS rebinding to make
+  # itself same-origin with the panel) — REQUIRED if bind is anything other
+  # than 127.0.0.1/::1/localhost, OR if trustedProxies (above) is set — a
+  # same-host reverse proxy serving this panel under its own public hostname
+  # (bind stays 127.0.0.1; nginx forwards Host: bot.example.com) needs this
+  # too, or your own browser gets rejected just like an attacker would.
+  # allowedHosts:
+  #   - bot.example.internal
+
+  # Disables the localhost bypass entirely, so even 127.0.0.1 needs a signed-in
+  # session. The bypass is already safe against a proxy that forwards
+  # X-Forwarded-For (any such header disqualifies a bare loopback address from
+  # the bypass — see panel/server.ts) — this is only needed if you front the
+  # panel with something that proxies to it WITHOUT ever setting that header,
+  # which is otherwise invisible to the bot.
+  requireLogin: false

@@ -240,6 +240,38 @@ Two more things worth knowing about limits:
   (`posting.node*`). It refuses to start if your cadence would exceed 80% of
   the *unregistered* daily ceiling, since every wallet starts in that tier.
 
+### Control panel
+
+A small browser UI for changing the display name and registering the wallet,
+served alongside the bot's normal schedule (not `--once`):
+
+```yaml
+panel:
+  enabled: true
+```
+
+The bot **always** signs with its own wallet (`OGMARA_WALLET_KEY`) — the panel
+never holds or asks for anyone else's key. `panel.adminWallets` instead names
+the *separate* wallets allowed to log in and drive the bot's wallet, exactly
+like the l2-node dashboard's `admin_wallets`: you prove ownership by signing a
+one-time challenge with your Klever Extension or K5, never by handing over a
+key.
+
+```yaml
+panel:
+  enabled: true
+  adminWallets:
+    - klv1youroperatorwallet...
+```
+
+From `http://127.0.0.1:8787` (the default), **no login is required at all** —
+matching the node dashboard's localhost bypass, and enough for
+`ssh -L 8787:localhost:8787` tunnelling with zero extra config. Only widen
+`panel.bind` beyond loopback once `adminWallets` is set, and only put a
+reverse proxy in front of it once you've read `panel.trustedProxies` and
+`panel.allowedHosts` in `config.example.yaml` — both exist to stop a
+misconfigured proxy from silently handing out that same bypass to everyone.
+
 ### Rate limits and the retry queue
 
 When the node throttles the bot, the **already-composed** post is parked in
@@ -276,7 +308,7 @@ npm run build                     # compile to dist/
 | P2 | AI providers — Claude, OpenAI, Gemini, OpenAI-compatible | **done** |
 | P3 | Topic source, image-directory source, media upload | **done** |
 | P4 | Rate-limit backoff, retries | **done** (in the 0.4.0 audit pass) |
-| P5 | Local web control panel (setup wizard, preview, approval) | planned |
+| P5 | Web control panel (display name, wallet registration, wallet-signature login) | **done** |
 | P6 | Docker, full docs, v1.0.0 | planned |
 
 ## Posting responsibly

@@ -5,6 +5,99 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-27
+
+A web control panel — the operator-facing piece deferred from P3, now built
+against the model requested directly: the bot keeps its own wallet (as it
+always has) and the panel lets a *separate* operator wallet log in to drive
+it, the same way the l2-node dashboard's `admin_wallets` works. The operator's
+wallet key never reaches the bot process — only a signed one-time login
+challenge does.
+
+### Added
+
+- **Control panel** (`panel.enabled: true`), served alongside the normal
+  scheduled runs. Lets a logged-in operator change the bot's display name and
+  trigger on-chain wallet registration (which raises the daily posting
+  ceiling 6x) from a browser, instead of the headless `--set-profile` /
+  `--register` CLI flags.
+- **Wallet-signature login**, no passwords: `GET /api/auth/challenge` issues a
+  single-use, 5-minute nonce; the operator's wallet signs it via the Klever
+  Extension or K5 (`window.klever`/`window.kleverWeb.signMessage`, same as the
+  main web client); `POST /api/auth/login` verifies the signature against the
+  server's own copy of the challenge message — the client never supplies what
+  it claims to have signed. Sessions are HMAC-SHA256 tokens with a random
+  per-process secret, so restarting the bot revokes every session at once.
+- **Localhost bypass**, matching the node dashboard: from 127.0.0.1/::1, no
+  login is required at all — enough for `ssh -L 8787:localhost:8787`
+  tunnelling with zero config. `panel.requireLogin: true` disables this for
+  operators fronting the panel with a proxy that forwards without ever
+  setting `X-Forwarded-For` (otherwise invisible to the bot).
+- `panel.adminWallets` — the wallets allowed to log in. Validated against the
+  real bech32 checksum at config load (see Security below).
+- `panel.trustedProxies` — reverse proxies whose `X-Forwarded-For` may be
+  believed, ported from the l2-node's right-to-left trusted-hop walk.
+- `panel.allowedHosts` — hostnames the panel answers to, beyond the built-in
+  `localhost`/`127.0.0.1`/`::1`. Defeats DNS-rebinding attacks against the
+  localhost bypass (see Security).
+- New module `src/address.ts`: real BIP-173 bech32 checksum validation for
+  `klv1...` addresses, written because `@ogmara/sdk`'s `addressToPubkey`
+  decodes bech32 *characters* but does not verify the checksum — a single
+  mistyped character in an admin-wallet address would otherwise decode
+  silently to a different (wrong) public key instead of failing config
+  validation.
+
+### Security
+
+This feature went through the full audit pipeline (code + security in
+parallel, then an independent re-verification pass), which caught real,
+serious issues before release — recorded here since they were fixed
+pre-release, not discovered in the wild:
+
+- **Critical**: the `X-Forwarded-For` truncation kept the wrong end of the
+  header (the attacker-controlled leftmost entries instead of the
+  proxy-appended trustworthy rightmost ones). A client behind a trusted local
+  reverse proxy could pad the header with 50+ fake `127.0.0.1` entries,
+  pushing the proxy's real appended client address out of the truncation
+  window, causing the resolver to fall back to the loopback peer — full
+  unauthenticated access, including the KLV-spending register endpoint. Fixed
+  by truncating from the correct end; verified with a live PoC replay that
+  the exact attack is now rejected end-to-end.
+- **High**: no `Host` header validation meant a DNS-rebinding page (an
+  attacker domain whose DNS re-resolves to 127.0.0.1) could become
+  same-origin with the panel, defeating both CORS and the loopback network
+  boundary. Fixed with a `Host` allowlist checked before every route.
+- **High**: a forwarding header resolving to an all-trusted chain still fell
+  back to the (loopback) peer and got the bypass — closed by requiring *no*
+  forwarding header at all (not just a resolved-non-loopback one) for the
+  bypass to apply.
+- **High**: `/api/register` was a check-then-act race against the chain — two
+  overlapping requests could both observe "unregistered" and both submit,
+  spending the non-refundable registration fee twice. Fixed with an in-flight
+  guard (409 on overlap) plus a client-side button disable.
+- **High**: a non-object JSON body (`null`, a bare string, a number, an
+  array) crashed a route handler with an unhandled `TypeError`, mapped to a
+  bare 500 — a free unauthenticated log-flood on the login endpoint. Fixed by
+  validating the parsed body's shape before use.
+- **Medium**: the unauthenticated challenge endpoint refused once 100
+  challenges were pending, letting an attacker permanently deny login to real
+  operators for the cost of ~20 requests/minute. Fixed by evicting the oldest
+  pending challenge instead of refusing — nonces are single-use and
+  self-expiring, so eviction costs nothing exploitable.
+- **Medium**: `server.close()` alone could hang indefinitely on a single
+  slow-loris-style connection, risking a systemd `SIGKILL` that skips the
+  ledger/queue flush on shutdown. Fixed with idle-connection closing plus a
+  bounded force-close timer, and added `requestTimeout`/`headersTimeout`/
+  `maxConnections` bounds that were entirely absent before.
+- Also fixed: case-sensitive loopback-address matching, a wallet-key decode
+  that silently zero-padded malformed input instead of failing, a missing
+  CSRF content-type gate on logout, missing `Cache-Control: no-store` on
+  responses carrying session tokens, and a config validation gap where
+  `panel.trustedProxies` was documented as schema-validated but wasn't.
+
+All shipped in the same release rather than as a follow-up — this is
+new code with no existing deployments to migrate.
+
 ## [0.6.0] - 2026-08-27
 
 P3 — the two remaining sources from the original brief: your own topics, and

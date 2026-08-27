@@ -16,6 +16,8 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
+import { describeAddressProblem, validateAddress } from './address.js';
+import { TrustedProxies } from './panel/clientip.js';
 import { isValidCron } from './scheduler.js';
 
 /**
@@ -280,6 +282,141 @@ const storageSchema = z.object({
   retentionDays: z.int().min(1).max(3650).default(90),
 });
 
+/**
+ * Control panel — a browser UI for driving the bot, gated by wallet signature.
+ *
+ * The trust model mirrors the l2-node dashboard: the bot holds its own wallet,
+ * and `adminWallets` names the *separate* wallets allowed to operate it. An
+ * operator signs a challenge with their own wallet to log in, then takes
+ * actions that the bot performs with the bot's wallet. Their key never reaches
+ * the bot.
+ */
+const panelSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    /**
+     * Interface to bind. Loopback by default: the panel can change what a
+     * public feed publishes and can spend KLV, so exposing it is an explicit
+     * decision, not a default.
+     */
+    bind: z.string().min(1).default('127.0.0.1'),
+    port: z.int().min(1).max(65535).default(8787),
+    /**
+     * Wallets permitted to log in. Empty means localhost-only — remote
+     * requests are refused outright, exactly as on the node.
+     */
+    adminWallets: z.array(z.string().min(1)).default([]),
+    sessionTtlHours: z.int().min(1).max(168).default(24),
+    /**
+     * Reverse proxies whose `X-Forwarded-For` may be believed, as addresses or
+     * CIDRs. Loopback is always trusted and need not be listed. Anything not
+     * listed has its forwarding headers ignored — see `panel/clientip.ts` for
+     * why that is the security boundary it looks like.
+     */
+    trustedProxies: z.array(z.string().min(1)).default([]),
+    /**
+     * Hostnames accepted by the panel's `Host`-header check, beyond the
+     * always-allowed `localhost` / `127.0.0.1` / `::1`. Required whenever
+     * `bind` is not loopback, since the check would otherwise reject every
+     * request the operator makes to their own panel. See `panel/server.ts`'s
+     * `isAllowedHost` — this is what stops a DNS-rebinding page (an attacker
+     * domain whose DNS re-resolves to 127.0.0.1) from becoming same-origin
+     * with the panel.
+     */
+    allowedHosts: z.array(z.string().min(1)).default([]),
+    /**
+     * Disable the localhost-bypass entirely, so every request — including
+     * from 127.0.0.1 — needs a signed-in session.
+     *
+     * The bypass is normally safe because a forwarding header (XFF/Forwarded)
+     * on a request is enough to disqualify a bare loopback *peer* address
+     * from the bypass (see server.ts) — but a reverse proxy that forwards to
+     * this bot WITHOUT ever setting such a header is invisible to that check.
+     * If you front this panel that way, set this to true.
+     */
+    requireLogin: z.boolean().default(false),
+  })
+  .superRefine((panel, ctx) => {
+    for (const [i, address] of panel.adminWallets.entries()) {
+      // Login is an exact string match, so a stray capital, a trailing space or
+      // a single mistyped character would silently lock the operator out with
+      // no diagnostic. `validateAddress` verifies the bech32 *checksum*, which
+      // is what actually catches a typo — note the SDK's `addressToPubkey`
+      // does NOT (see src/address.ts), so it must not be used for this.
+      const problem = validateAddress(address, 'klv');
+      if (problem !== undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['adminWallets', i],
+          message: `panel.adminWallets["${address}"] ${describeAddressProblem(problem)}`,
+        });
+      }
+    }
+
+    for (const [i, entry] of panel.trustedProxies.entries()) {
+      try {
+        new TrustedProxies([entry]);
+      } catch (err) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['trustedProxies', i],
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Binding beyond loopback with nobody authorised is unusable, not merely
+    // useless: every remote request is refused and the localhost bypass never
+    // applies (in Docker the peer is the bridge gateway, not loopback), so the
+    // operator is locked out of a panel they believe they exposed. The same
+    // lockout shape applies to requireLogin: true with no admin wallets — that
+    // combination means literally no one, including the operator, could ever
+    // log in.
+    const loopbackBind =
+      panel.bind === '127.0.0.1' || panel.bind === '::1' || panel.bind === 'localhost';
+    if (panel.enabled && (!loopbackBind || panel.requireLogin) && panel.adminWallets.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['adminWallets'],
+        message: panel.requireLogin
+          ? 'panel.requireLogin is true but no adminWallets are configured, so no one ' +
+            '(not even from localhost) could ever log in. Add the wallet address you ' +
+            'will sign in with.'
+          : `panel.bind is "${panel.bind}" but no adminWallets are configured, so no one ` +
+            'could log in remotely. Add the wallet address you will sign in with, or set ' +
+            'panel.bind to 127.0.0.1 for localhost-only access.',
+      });
+    }
+
+    // Without at least one allowed hostname, EVERY request naming a hostname
+    // other than localhost/127.0.0.1/::1 gets rejected by the Host-header
+    // check — including the operator's own. This bites two shapes, not just
+    // "bind is non-loopback": a non-loopback bind is reached by IP/hostname
+    // directly, but so is a LOOPBACK-bound panel put behind a same-host
+    // reverse proxy serving it under a public hostname (bind stays
+    // 127.0.0.1; nginx forwards Host: bot.example.com) — trustedProxies being
+    // configured is the signal for that second shape, since there would be
+    // no reason to declare a trusted proxy otherwise.
+    if (
+      panel.enabled &&
+      (!loopbackBind || panel.trustedProxies.length > 0) &&
+      panel.allowedHosts.length === 0
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['allowedHosts'],
+        message:
+          (loopbackBind
+            ? 'panel.trustedProxies is configured, implying a reverse proxy in front of this ' +
+              'panel, but no allowedHosts are configured'
+            : `panel.bind is "${panel.bind}" but no allowedHosts are configured`) +
+          ' — every request naming a different hostname would be rejected by the ' +
+          'Host-header check (see panel/server.ts). Add the hostname or IP you will use ' +
+          'to reach the panel.',
+      });
+    }
+  });
+
 const configSchema = z.object({
   node: nodeSchema,
   // `prefault` rather than `default`: Zod 4's `.default()` takes an *output*
@@ -292,6 +429,7 @@ const configSchema = z.object({
   profile: profileSchema.prefault({}),
   queue: queueSchema.prefault({}),
   storage: storageSchema.prefault({}),
+  panel: panelSchema.prefault({}),
 });
 
 /** Fully validated bot configuration (secrets excluded). */

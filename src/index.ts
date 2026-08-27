@@ -23,6 +23,9 @@ import {
   OgmaraPublisher,
   type ComposedPost,
 } from './ogmara.js';
+import { PanelAuth } from './panel/auth.js';
+import { TrustedProxies } from './panel/clientip.js';
+import { startPanel, type Panel } from './panel/server.js';
 import { PostQueue } from './queue.js';
 import { runOnce, type RunOutcome } from './pipeline.js';
 import { schedule, type ScheduledJob } from './scheduler.js';
@@ -95,6 +98,14 @@ Identity:
                     and cannot be undone. Raises the node's daily posting
                     ceiling from 50 to 300. Asks for confirmation first.
   -y, --yes         Skip that confirmation (for scripted use)
+
+Control panel:
+  Set panel.enabled: true in the config to serve a small web UI for changing
+  the display name and registering the wallet, while the bot runs on its
+  schedule. The bot always signs with its own wallet; panel.adminWallets
+  names the SEPARATE operator wallets allowed to log in and drive it — same
+  model as the l2-node dashboard. Always reachable with no login from
+  localhost; add panel.adminWallets to allow signed-in remote access.
 
 Secrets come from the environment (or a .env file), never the config file:
   OGMARA_WALLET_KEY   Bot wallet private key, 64 hex characters
@@ -478,6 +489,13 @@ async function run(args: CliArgs): Promise<number> {
     return 0;
   }
 
+  // The panel only makes sense for a long-running instance — `--once` exits
+  // immediately, which would start a server nobody could ever reach.
+  let panel: Panel | undefined;
+  if (effective.panel.enabled) {
+    panel = await startControlPanel(effective, secrets, publisher);
+  }
+
   // One job per enabled source, each on its own cron. They share the run
   // pipeline, and the scheduler's overlap guard is per-job, so two sources
   // firing on the same minute run sequentially rather than racing the ledger.
@@ -505,16 +523,91 @@ async function run(args: CliArgs): Promise<number> {
   console.log('\nRunning. Press Ctrl+C to stop.');
 
   await new Promise<void>((resolve) => {
+    let shuttingDown = false;
     const shutdown = (): void => {
+      // Both SIGINT and SIGTERM can arrive in the same forceful kill; without
+      // this guard a second signal re-stops already-stopped jobs, prints
+      // "Stopping…" twice, and calls panel.close() a second time.
+      if (shuttingDown) return;
+      shuttingDown = true;
       console.log('\nStopping…');
       for (const job of jobs) job.stop();
-      resolve();
+      if (panel === undefined) {
+        resolve();
+        return;
+      }
+      // close() cannot reject today (its callback ignores its error
+      // argument), but guarding it costs nothing and removes the dependence
+      // on that staying true.
+      panel.close().catch(() => {}).finally(resolve);
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
   });
 
   return 0;
+}
+
+/**
+ * Start the control panel, translating config validation errors and bind
+ * failures into the same "fail loudly at startup" style as the rest of `run`.
+ */
+async function startControlPanel(
+  config: Config,
+  secrets: Secrets,
+  publisher: OgmaraPublisher,
+): Promise<Panel> {
+  let trustedProxies: TrustedProxies;
+  try {
+    trustedProxies = new TrustedProxies(config.panel.trustedProxies);
+  } catch (err) {
+    // Reachable in principle even though the schema also validates CIDR shape
+    // (config.ts's superRefine): keeping the check here too means a future
+    // schema change can't silently drop it and leave this constructor as the
+    // only backstop against a malformed trusted-proxy list.
+    throw new ConfigError(
+      `invalid panel.trustedProxies: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const auth = new PanelAuth({
+    adminWallets: config.panel.adminWallets,
+    botAddress: publisher.address,
+    network: config.node.network,
+    sessionTtlHours: config.panel.sessionTtlHours,
+  });
+
+  const panel = await startPanel(config.panel.bind, config.panel.port, {
+    auth,
+    trustedProxies,
+    network: config.node.network,
+    client: publisher.client,
+    signer: publisher.signer,
+    botAddress: publisher.address,
+    walletKeyHex: secrets.walletKeyHex,
+    dailyLimitFn: () => publisher.dailyLimit,
+    burstLimitFn: () => publisher.burstLimit,
+    dryRunFn: () => config.posting.dryRun,
+    checkRegistration,
+    applyProfile,
+    registerWallet,
+    allowedHosts: config.panel.allowedHosts,
+    requireLogin: config.panel.requireLogin,
+  });
+
+  console.log(
+    `Panel:   http://${config.panel.bind}:${panel.port} ` +
+      `(${auth.remoteLoginEnabled ? `${config.panel.adminWallets.length} wallet(s) authorised` : 'localhost-only, no remote login configured'})`,
+  );
+  if (!auth.remoteLoginEnabled && !config.panel.requireLogin) {
+    console.log(
+      '  Anyone able to reach this port from 127.0.0.1 gets full access with no login — ' +
+        'that includes a reverse proxy on this host that forwards WITHOUT setting ' +
+        'X-Forwarded-For. If you front this panel, either configure that header or set ' +
+        'panel.requireLogin: true.',
+    );
+  }
+  return panel;
 }
 
 async function main(): Promise<void> {
