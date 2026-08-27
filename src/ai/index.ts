@@ -71,6 +71,7 @@ export async function createProvider(config: AiConfig, secrets: AiSecrets): Prom
         apiKey: secrets.openaiCompatibleApiKey ?? 'not-needed',
         model: config.model,
         baseUrl: config.baseUrl,
+        supportsVision: config.compatibleSupportsVision,
         maxTokens: config.maxTokens,
       });
     }

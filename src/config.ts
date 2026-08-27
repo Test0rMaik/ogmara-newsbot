@@ -141,8 +141,52 @@ const rssSourceSchema = z.object({
   maxBytes: z.int().min(1024).max(50 * 1024 * 1024).default(5 * 1024 * 1024),
 });
 
+const topicsSourceSchema = z.object({
+  enabled: z.boolean().default(false),
+  schedule: z
+    .string()
+    .default('0 */6 * * *')
+    .refine(isValidCron, { message: 'not a valid cron expression' }),
+  /** Subjects to write about, in your own words. */
+  topics: z.array(z.string().min(3).max(300)).default([]),
+  /**
+   * Minimum gap before the same topic can be posted again.
+   *
+   * Enforced through the dedup key rather than extra state, so it survives
+   * restarts. Keep it well above your schedule interval or a short topic list
+   * will read as repetitive.
+   */
+  minIntervalHours: z.int().min(1).max(8760).default(168),
+});
+
+const imageDirSourceSchema = z.object({
+  enabled: z.boolean().default(false),
+  schedule: z
+    .string()
+    .default('0 12 * * *')
+    .refine(isValidCron, { message: 'not a valid cron expression' }),
+  /** Directories to scan. Not recursive — subdirectories are ignored. */
+  directories: z.array(z.string().min(1)).default([]),
+  /** Skip images larger than this. Must stay at or below the node's cap. */
+  maxBytes: z
+    .int()
+    .min(1024)
+    .max(50 * 1024 * 1024)
+    .default(8 * 1024 * 1024),
+  /**
+   * Content rating for image posts specifically.
+   *
+   * Separate from `posting.contentRating` because a folder of photographs may
+   * warrant a different label than a world-news feed, and mislabelling is a
+   * reportable offence under the moderation spec. Omit to use the global one.
+   */
+  contentRating: contentRating.optional(),
+});
+
 const sourcesSchema = z.object({
   rss: rssSourceSchema.prefault({}),
+  topics: topicsSourceSchema.prefault({}),
+  imagedir: imageDirSourceSchema.prefault({}),
 });
 
 const aiSchema = z
@@ -168,6 +212,19 @@ const aiSchema = z
     maxTokens: z.int().min(256).max(64_000).default(4096),
     /** Prompt template used for feed-derived posts. */
     promptPath: z.string().min(1).default('prompts/news.md'),
+    /** Prompt template for the topics source. */
+    topicPromptPath: z.string().min(1).default('prompts/topic.md'),
+    /** Prompt template for the image-directory source. */
+    imagePromptPath: z.string().min(1).default('prompts/image.md'),
+    /**
+     * Whether the configured `openai-compatible` model accepts images.
+     *
+     * Only consulted for that provider — the cloud providers' frontier models
+     * are all vision-capable. A local text-only model must declare `false` so
+     * enabling the image source fails at startup rather than at the first
+     * image post.
+     */
+    compatibleSupportsVision: z.boolean().default(false),
     /** Rough body-length target handed to the model as guidance. */
     targetContentChars: z.int().min(100).max(10_000).default(600),
     /**

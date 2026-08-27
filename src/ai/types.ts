@@ -17,10 +17,27 @@
  *    process. See {@link ComposeRefusal}.
  */
 
+/** An image handed to a vision-capable model. */
+export interface ComposeImage {
+  /** Raw image bytes. */
+  data: Uint8Array;
+  /** MIME type, e.g. `image/jpeg`. */
+  mimeType: string;
+}
+
 /** What the composer is being asked to write about. */
 export interface ComposeRequest {
   /** Rendered prompt — instructions plus the source material. */
   prompt: string;
+  /**
+   * Image to describe, for the image-directory source.
+   *
+   * When set, the provider must send it alongside the prompt. Providers that
+   * cannot do vision throw {@link AiConfigError} rather than silently
+   * composing from the prompt alone — a caption invented without ever seeing
+   * the picture is worse than an error, because it looks like it worked.
+   */
+  image?: ComposeImage | undefined;
   /** Upper bound for the title, in bytes (protocol cap is 256). */
   maxTitleBytes: number;
   /** Rough target for body length, in characters. Guidance, not enforced. */
@@ -63,6 +80,15 @@ export interface AiProvider {
   readonly id: ProviderId;
   /** Model identifier in use, for logging. */
   readonly model: string;
+  /**
+   * Whether this provider can accept an image.
+   *
+   * Reported rather than assumed: the frontier models of all three cloud
+   * providers do vision, but an `openai-compatible` endpoint may be serving a
+   * text-only local model, so the bot must fail clearly at startup rather
+   * than at the first image post.
+   */
+  readonly supportsVision: boolean;
   compose(request: ComposeRequest): Promise<ComposeResult>;
 }
 

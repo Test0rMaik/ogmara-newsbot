@@ -92,6 +92,44 @@ sources:
       - url: https://www.theguardian.com/world/rss
         publisher: The Guardian
 
+  # Your own topics — the bot writes about subjects you define, with no
+  # external source. The only source with no untrusted input.
+  topics:
+    enabled: false
+    schedule: "0 */6 * * *"     # every 6 hours
+
+    # Written in your own words; the model writes a post about each.
+    topics:
+      - The Klever blockchain ecosystem
+      - Decentralized social networks and censorship resistance
+
+    # Minimum gap before the same topic comes round again. Keep this well
+    # above your schedule interval or a short list reads as repetitive.
+    minIntervalHours: 168        # one week
+
+  # Post pictures from local folders, captioned by a vision model.
+  #
+  # Requires a vision-capable model AND a node with media uploads available;
+  # the bot checks both at startup and refuses rather than posting a caption
+  # for a picture the model never saw.
+  imagedir:
+    enabled: false
+    schedule: "0 12 * * *"       # once a day at noon
+
+    # Scanned NON-recursively — subdirectories are ignored on purpose, so
+    # pointing at a folder can't sweep up an entire home directory.
+    directories:
+      - /home/you/pictures/bot
+
+    # Skip anything larger. Must stay at or below your node's upload cap
+    # (ipfs.max_upload_size_mb, 50 MB by default).
+    maxBytes: 8388608            # 8 MB
+
+    # Rating for image posts specifically, overriding posting.contentRating.
+    # Worth setting deliberately: mislabelling is a reportable offence under
+    # the moderation spec.
+    contentRating: general
+
 ai:
   # anthropic | openai | gemini | openai-compatible
   # See docs/AI-PROVIDERS.md. Only the chosen provider's API key is needed.
@@ -120,9 +158,17 @@ ai:
   # Output cap. A post is small — this is headroom, not a target.
   maxTokens: 4096
 
-  # The prompt is where your bot gets its voice. Edit prompts/news.md, or point
-  # this at your own file.
-  promptPath: prompts/news.md
+  # The prompts are where your bot gets its voice — one per source kind.
+  # Edit them, or point these at your own files.
+  promptPath: prompts/news.md         # rss
+  topicPromptPath: prompts/topic.md   # topics
+  imagePromptPath: prompts/image.md   # imagedir
+
+  # Only for provider: openai-compatible. Set true if your local model accepts
+  # images; the cloud providers' frontier models all do. Enabling the image
+  # source with a text-only model is refused at startup rather than producing
+  # captions for pictures the model never saw.
+  compatibleSupportsVision: false
 
   # Rough body-length target passed to the model as guidance.
   targetContentChars: 600

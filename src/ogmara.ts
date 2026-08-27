@@ -8,7 +8,13 @@
  * payload validation against the protocol caps before anything is signed.
  */
 
-import { OgmaraClient, WalletSigner, buildNewsPost } from '@ogmara/sdk';
+import {
+  OgmaraClient,
+  WalletSigner,
+  buildNewsPost,
+  type Attachment,
+  type ContentRating,
+} from '@ogmara/sdk';
 import { MAX_CONTENT_BYTES, MAX_TITLE_BYTES, type Config, type Secrets } from './config.js';
 import { MAX_TAGS, MAX_TAG_BYTES } from './hashtags.js';
 
@@ -23,6 +29,15 @@ export interface ComposedPost {
   title: string;
   content: string;
   tags: string[];
+  /** Uploaded media, already on IPFS. Empty for text-only posts. */
+  attachments?: Attachment[];
+  /**
+   * Rating for this specific post, overriding the global setting.
+   *
+   * Lets an image source carry a different label than a news feed — the
+   * moderation spec makes misrating reportable, so per-source control matters.
+   */
+  contentRating?: ContentRating;
 }
 
 /**
@@ -387,8 +402,11 @@ export class OgmaraPublisher {
       const envelope = await buildNewsPost(this.#signer, {
         title: post.title,
         content: post.content,
-        contentRating: this.#config.posting.contentRating,
+        contentRating: post.contentRating ?? this.#config.posting.contentRating,
         tags: post.tags,
+        ...(post.attachments !== undefined && post.attachments.length > 0
+          ? { attachments: post.attachments }
+          : {}),
       });
       const { msg_id } = await this.#client.sendMessageEnvelope(envelope);
       return { status: 'published', msgId: msg_id };

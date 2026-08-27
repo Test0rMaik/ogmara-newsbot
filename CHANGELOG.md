@@ -5,6 +5,89 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-27
+
+P3 — the two remaining sources from the original brief: your own topics, and
+local image folders. With RSS from P1, all three source kinds now work.
+
+### Added
+
+- **Topics source.** Writes about subjects the operator defines, with no
+  external fetch. The only source with no untrusted input, so the prompt
+  fencing the RSS path needs is unnecessary here — and the prompt says so,
+  since fencing an operator's own instruction would tell the model to ignore
+  its own configuration.
+
+  Topics *rotate* rather than being generated in bulk: the leading topic shifts
+  each interval, so a short list doesn't read as repetitive and topic #1
+  doesn't win selection every time. The re-post gap is enforced by bucketing
+  the dedup key, so it needs no extra state and survives restarts.
+
+- **Image-directory source.** Picks a random unposted image, captions it with a
+  vision model, uploads it to IPFS through the node and attaches it.
+
+  Images are keyed by **content hash, not path**, so renaming a file or copying
+  it into a second watched folder doesn't republish it. Directories are scanned
+  **non-recursively** on purpose — pointing this at a folder should not be able
+  to sweep up everything beneath it. Selection is shuffled, because a folder
+  posted in filename order reads like a directory listing.
+
+- **Vision support across all providers**, each in its native format: Anthropic
+  base64 image blocks (image before text, which is the documented ordering and
+  measurably better), OpenAI `image_url` data URIs, Gemini `inlineData` parts.
+  `AiProvider.supportsVision` is *reported* rather than assumed — an
+  `openai-compatible` endpoint may be serving a text-only model, so operators
+  declare it via `ai.compatibleSupportsVision`.
+
+- **Media upload** (`src/media.ts`), validating against what the node actually
+  enforces: an `image/` MIME type and a size cap. It distinguishes the node's
+  503 (IPFS backend offline) from a bad file, because those need different
+  fixes from the operator.
+
+- Per-source prompts (`prompts/topic.md`, `prompts/image.md`) and per-source
+  cron schedules, so news, topics and images can run at different cadences.
+
+- `sources.imagedir.contentRating` overrides the global rating for image posts
+  specifically — a folder of photographs may warrant a different label than a
+  news feed, and mislabelling is reportable under the moderation spec.
+
+### Changed
+
+- Two prerequisites for the image source are now checked **at startup** rather
+  than at the first image post: the model must accept images, and the node must
+  report media uploads available. Both refuse to start with a message naming
+  the fix. A caption written for a picture the model never saw is worse than an
+  error, because it looks like it worked.
+
+- **Dry run validates images but does not upload them.** The upload happens
+  before `publish()` short-circuits, so a dry run would otherwise pin bytes to
+  IPFS for a post that is never published — a real side effect in a mode that
+  promises none. Every other check still runs, and the render says
+  `(validated, not uploaded — dry run)` so the operator isn't left believing
+  the upload was proven.
+
+- Attribution is appended for feed items only. A topic post has no source
+  article and an image from a local folder has no publisher to credit.
+
+- Uploads happen *after* composition. If the model refuses or composing fails,
+  an earlier upload would have pinned bytes for a post that never exists — and
+  composition is the likelier of the two to fail.
+
+- An upload failure is bounded by the same per-item failure counter as a
+  compose failure, rather than publishing an image post with no image.
+
+### Notes
+
+- 167 tests (up from 141), typecheck clean, `npm audit` 0 vulnerabilities.
+- Verified end-to-end against a mock OpenAI-compatible server that reports what
+  it received: the image arrives as a `data:image/png` URI alongside the real
+  `prompts/image.md` text, the topic path sends the topic template with no
+  fence, and the RSS path still fences. The startup vision guard and the
+  shipped `config.example.yaml` were both exercised too.
+- **Still un-live-verified:** the three vendor APIs, now including their vision
+  paths, and a completed registration transaction. No API keys or funded wallet
+  available.
+
 ## [0.5.0] - 2026-08-27
 
 Bot identity: a display name, and on-chain registration for the higher posting

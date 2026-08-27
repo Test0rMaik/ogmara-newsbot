@@ -44,6 +44,7 @@ const REFUSAL_FINISH_REASONS = new Set([
 export class GeminiProvider implements AiProvider {
   readonly id = 'gemini' as const;
   readonly model: string;
+  readonly supportsVision = true;
 
   readonly #client: GoogleGenAI;
   readonly #maxTokens: number;
@@ -62,7 +63,23 @@ export class GeminiProvider implements AiProvider {
     try {
       response = await this.#client.models.generateContent({
         model: this.model,
-        contents: request.prompt,
+        contents:
+          request.image === undefined
+            ? request.prompt
+            : [
+                {
+                  role: 'user',
+                  parts: [
+                    {
+                      inlineData: {
+                        mimeType: request.image.mimeType,
+                        data: Buffer.from(request.image.data).toString('base64'),
+                      },
+                    },
+                    { text: request.prompt },
+                  ],
+                },
+              ],
         config: {
           maxOutputTokens: this.#maxTokens,
           responseMimeType: 'application/json',

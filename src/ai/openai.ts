@@ -29,12 +29,15 @@ export interface OpenAiProviderOptions {
   model: string;
   /** Override for OpenAI-compatible servers (Ollama, OpenRouter, vLLM, …). */
   baseUrl?: string | undefined;
+  /** Whether the configured compatible model accepts images. Ignored for real OpenAI. */
+  supportsVision?: boolean | undefined;
   maxTokens: number;
 }
 
 export class OpenAiProvider implements AiProvider {
   readonly id: ProviderId;
   readonly model: string;
+  readonly supportsVision: boolean;
 
   readonly #client: OpenAI;
   readonly #maxTokens: number;
@@ -52,6 +55,9 @@ export class OpenAiProvider implements AiProvider {
     this.id = options.baseUrl !== undefined ? 'openai-compatible' : 'openai';
     this.model = options.model;
     this.#maxTokens = options.maxTokens;
+    // OpenAI's own frontier models are all vision-capable. A compatible
+    // endpoint may be serving anything, so the operator declares it.
+    this.supportsVision = options.baseUrl === undefined ? true : (options.supportsVision ?? false);
   }
 
   async compose(request: ComposeRequest): Promise<ComposeResult> {
@@ -60,7 +66,7 @@ export class OpenAiProvider implements AiProvider {
       completion = await this.#client.chat.completions.create({
         model: this.model,
         max_completion_tokens: this.#maxTokens,
-        messages: [{ role: 'user', content: request.prompt }],
+        messages: [{ role: 'user', content: buildContent(request) }],
         response_format: {
           type: 'json_schema',
           json_schema: {
@@ -112,6 +118,18 @@ export class OpenAiProvider implements AiProvider {
     }
     return parseComposeResult(parsed);
   }
+}
+
+/** Build the user turn, attaching the image as a data URI when present. */
+function buildContent(
+  request: ComposeRequest,
+): string | OpenAI.Chat.ChatCompletionContentPart[] {
+  if (request.image === undefined) return request.prompt;
+  const b64 = Buffer.from(request.image.data).toString('base64');
+  return [
+    { type: 'image_url', image_url: { url: `data:${request.image.mimeType};base64,${b64}` } },
+    { type: 'text', text: request.prompt },
+  ];
 }
 
 /** Map SDK errors to a permanent config error, or rethrow transient ones. */

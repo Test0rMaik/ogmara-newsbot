@@ -17,9 +17,11 @@ import type { Config } from './config.js';
 import { isNearDuplicate } from './dedup.js';
 import { buildTags } from './hashtags.js';
 import { Ledger } from './ledger.js';
+import { uploadImage, validateImageOnly } from './media.js';
 import { MAX_TITLE_BYTES, type ComposedPost, type OgmaraPublisher } from './ogmara.js';
 import type { PostQueue } from './queue.js';
-import type { Candidate, Source } from './sources/types.js';
+import { readFileSync } from 'node:fs';
+import type { Candidate, Source, SourceKind } from './sources/types.js';
 
 /** What happened during one pipeline run. */
 export type RunOutcome =
@@ -126,29 +128,57 @@ export async function composeWithAi(
   candidate: Candidate,
   config: Config,
   provider: AiProvider,
-  template: string,
+  templates: Templates,
 ): Promise<ComposeOutcome> {
-  // Cap, then fence. Both untrusted fields go inside one fence with a
-  // per-call random marker; the publisher name is bot-side config or the
-  // feed's own <title>, so it stays outside. See fenceUntrusted for why.
-  const marker = newFenceMarker();
-  const item = [
-    `Headline: ${capText(candidate.title, config.ai.maxSourceTitleChars)}`,
-    '',
-    'Summary:',
-    capText(candidate.summary ?? '(no summary provided)', config.ai.maxSourceSummaryChars),
-  ].join('\n');
-
-  const prompt = renderTemplate(template, {
-    FENCED_ITEM: fenceUntrusted(item, marker),
-    PUBLISHER: capText(candidate.publisher ?? 'unknown', 200),
+  const common = {
     MAX_TITLE_BYTES: MAX_TITLE_BYTES,
     TARGET_CONTENT_CHARS: config.ai.targetContentChars,
     MAX_TAGS: config.ai.maxTags,
-  });
+  };
+
+  let prompt: string;
+  let image: { data: Uint8Array; mimeType: string } | undefined;
+
+  switch (candidate.kind) {
+    case 'rss': {
+      // Cap, then fence. Both untrusted fields go inside one fence with a
+      // per-call random marker; the publisher name is bot-side config or the
+      // feed's own <title>, so it stays outside. See fenceUntrusted for why.
+      const marker = newFenceMarker();
+      const item = [
+        `Headline: ${capText(candidate.title, config.ai.maxSourceTitleChars)}`,
+        '',
+        'Summary:',
+        capText(candidate.summary ?? '(no summary provided)', config.ai.maxSourceSummaryChars),
+      ].join('\n');
+      prompt = renderTemplate(templates.rss, {
+        ...common,
+        FENCED_ITEM: fenceUntrusted(item, marker),
+        PUBLISHER: capText(candidate.publisher ?? 'unknown', 200),
+      });
+      break;
+    }
+
+    case 'topics':
+      // No fence: the topic is the operator's own text, not remote input.
+      prompt = renderTemplate(templates.topics, { ...common, TOPIC: candidate.title });
+      break;
+
+    case 'imagedir': {
+      if (candidate.imagePath === undefined || candidate.imageMimeType === undefined) {
+        throw new Error('image candidate is missing its path or MIME type');
+      }
+      image = { data: readFileSync(candidate.imagePath), mimeType: candidate.imageMimeType };
+      // No untrusted text at all — the model sees only the picture and the
+      // operator's own prompt.
+      prompt = renderTemplate(templates.imagedir, common);
+      break;
+    }
+  }
 
   const result = await provider.compose({
     prompt,
+    ...(image !== undefined ? { image } : {}),
     maxTitleBytes: MAX_TITLE_BYTES,
     targetContentChars: config.ai.targetContentChars,
     maxTags: config.ai.maxTags,
@@ -162,7 +192,10 @@ export async function composeWithAi(
     };
   }
 
-  const content = withAttribution(result.content, candidate, config);
+  // Attribution is for feed items only: a topic post has no source, and an
+  // image from a local folder has no publisher to credit.
+  const content =
+    candidate.kind === 'rss' ? withAttribution(result.content, candidate, config) : result.content;
   return {
     status: 'ok',
     post: {
@@ -180,6 +213,9 @@ export async function composeWithAi(
   };
 }
 
+/** Prompt templates, one per source kind, pre-loaded at startup. */
+export type Templates = Readonly<Record<SourceKind, string>>;
+
 /** Dependencies for {@link runOnce}. */
 export interface PipelineDeps {
   config: Config;
@@ -188,8 +224,8 @@ export interface PipelineDeps {
   queue: PostQueue;
   publisher: OgmaraPublisher;
   provider: AiProvider;
-  /** Pre-loaded prompt template, so a run doesn't re-read it from disk. */
-  template: string;
+  /** Pre-loaded prompt templates, so a run doesn't re-read them from disk. */
+  templates: Templates;
   /** Injected for tests. */
   now?: () => number;
 }
@@ -202,7 +238,7 @@ export interface PipelineDeps {
  * feed), leaving the O(n) comparison for genuinely new items only.
  */
 export async function runOnce(deps: PipelineDeps): Promise<RunOutcome> {
-  const { config, sources, ledger, queue, publisher, provider, template } = deps;
+  const { config, sources, ledger, queue, publisher, provider, templates } = deps;
   const now = deps.now ?? Date.now;
 
   const runStartedAt = now();
@@ -269,7 +305,7 @@ export async function runOnce(deps: PipelineDeps): Promise<RunOutcome> {
 
   let composed: ComposeOutcome;
   try {
-    composed = await composeWithAi(fresh, config, provider, template);
+    composed = await composeWithAi(fresh, config, provider, templates);
   } catch (err) {
     // A compose failure must not abort the run and leave the item unrecorded:
     // candidates are sorted newest-first, so `find` would return the same
@@ -310,6 +346,41 @@ export async function runOnce(deps: PipelineDeps): Promise<RunOutcome> {
     };
   }
   const post = composed.post;
+
+  // Upload after composing, not before: if the model refuses or the compose
+  // fails, an upload would have pinned bytes to IPFS for a post that never
+  // exists. Composition is also the likelier of the two to fail.
+  if (fresh.imagePath !== undefined && fresh.imageMimeType !== undefined) {
+    try {
+      // Dry run validates the image but does not upload it. Pinning bytes to
+      // IPFS for a post that is never published is a real side effect, and
+      // "dry run" promises none. Everything except the network write is still
+      // exercised, and the render says the upload was skipped so the operator
+      // is not left thinking it was proven.
+      const attachment = config.posting.dryRun
+        ? await validateImageOnly(fresh.imagePath, fresh.imageMimeType, config.sources.imagedir.maxBytes)
+        : await uploadImage(
+            publisher.client,
+            fresh.imagePath,
+            fresh.imageMimeType,
+            config.sources.imagedir.maxBytes,
+          );
+      post.attachments = [attachment];
+      const rating = config.sources.imagedir.contentRating;
+      if (rating !== undefined) post.contentRating = rating;
+    } catch (err) {
+      // Publishing an image post with no image would be worse than skipping
+      // it — the caption references a picture the reader cannot see.
+      const reason = err instanceof Error ? err.message : String(err);
+      const failures = ledger.recordFailure(fresh.dedupKey, now());
+      console.error(`  image upload failed (attempt ${failures}/${MAX_COMPOSE_FAILURES}): ${reason}`);
+      if (failures >= MAX_COMPOSE_FAILURES) {
+        console.error('  giving up on this image and marking it seen.');
+        ledger.record({ key: fresh.dedupKey, title: fresh.title, postedAt: now(), kind: fresh.kind });
+      }
+      return { status: 'compose-failed', title: fresh.title, reason };
+    }
+  }
 
   // Park the composed post rather than discarding it on any deferral:
   // recomposing means a second AI call for output already paid for, and the

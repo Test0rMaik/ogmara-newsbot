@@ -3,13 +3,13 @@
 A self-hostable bot that publishes AI-composed posts to the
 [Ogmara](https://ogmara.org) News Feed.
 
-Point it at news sources, your own topics, or a folder of images. It composes
+Point it at news feeds, your own topics, or a folder of images. It composes
 posts with the AI provider of your choice, adds hashtags, and publishes them to
 a decentralized feed under a wallet you control.
 
-> **Status: early development (v0.5.0).** The bot reads real RSS/Atom feeds,
-> composes posts with the AI provider of your choice, and publishes them on a
-> schedule without duplicates. See [Roadmap](#roadmap).
+> **Status: early development (v0.6.0).** Three sources — news feeds, your own
+> topics, and local image folders — composed by the AI provider of your choice
+> and published on a schedule without duplicates. See [Roadmap](#roadmap).
 
 ## Why a dry run by default
 
@@ -89,6 +89,66 @@ sources:
       - url: https://feeds.bbci.co.uk/news/world/rss.xml
         publisher: BBC News
 ```
+
+### Your own topics
+
+No feeds, no fetching — the bot writes about subjects you define:
+
+```yaml
+sources:
+  topics:
+    enabled: true
+    schedule: "0 */6 * * *"
+    topics:
+      - The Klever blockchain ecosystem
+      - Decentralized social networks and censorship resistance
+    minIntervalHours: 168      # don't repeat a topic within a week
+```
+
+This is the only source with no external input, which makes it the safest one:
+nothing an attacker controls reaches the prompt.
+
+Topics rotate rather than cycling in order, so a short list doesn't read as
+repetitive. The re-post gap is enforced through the dedup ledger, so it
+survives restarts.
+
+The prompt tells the model to write from durable knowledge rather than
+inventing specifics — there's no source article behind a topic post, so
+anything specific it states is unverifiable.
+
+### Local image folders
+
+```yaml
+sources:
+  imagedir:
+    enabled: true
+    schedule: "0 12 * * *"
+    directories:
+      - /home/you/pictures/bot
+    maxBytes: 8388608
+    contentRating: general
+```
+
+A random unposted image is picked, captioned by a vision model, uploaded to
+IPFS through your node, and attached to the post.
+
+Things worth knowing:
+
+- **Images are identified by content, not filename.** Renaming a file or
+  copying it into another watched folder won't republish it.
+- **Directories are not scanned recursively.** Deliberate — pointing this at a
+  folder shouldn't be able to sweep up everything beneath it.
+- **Both prerequisites are checked at startup**: the model must accept images,
+  and your node must have media uploads available. The bot refuses to start
+  otherwise, rather than captioning a picture the model never saw.
+- **In dry run the image is validated but not uploaded.** Pinning bytes to
+  IPFS for a post that's never published would be a real side effect, so the
+  render says `(validated, not uploaded — dry run)`.
+- Set `contentRating` deliberately. Mislabelling is a reportable offence under
+  the moderation spec.
+
+Running a local model? Set `ai.compatibleSupportsVision: true` only if it
+genuinely accepts images.
 
 ### Choosing an AI provider
 
@@ -214,8 +274,8 @@ npm run build                     # compile to dist/
 | P0 | Config, wallet, node connection, publish pipeline, dry-run | **done** |
 | P1 | RSS source, dedup ledger, scheduler | **done** |
 | P2 | AI providers — Claude, OpenAI, Gemini, OpenAI-compatible | **done** |
-| P3 | Topic source, image-directory source, media upload | planned |
-| P4 | Rate-limit backoff, retries, structured logging | planned |
+| P3 | Topic source, image-directory source, media upload | **done** |
+| P4 | Rate-limit backoff, retries | **done** (in the 0.4.0 audit pass) |
 | P5 | Local web control panel (setup wizard, preview, approval) | planned |
 | P6 | Docker, full docs, v1.0.0 | planned |
 

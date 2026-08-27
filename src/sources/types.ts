@@ -31,6 +31,10 @@ export interface Candidate {
   publisher?: string;
   /** Publication time in Unix milliseconds, if known. */
   publishedAt?: number;
+  /** Absolute path to an image to post, for the image-directory source. */
+  imagePath?: string;
+  /** MIME type of {@link imagePath}. */
+  imageMimeType?: string;
 }
 
 /** A configured, pollable source. */

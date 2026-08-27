@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -40,6 +40,11 @@ const CONFIG = {
 } as unknown as Config;
 
 const TEMPLATE = 'Publisher {{PUBLISHER}}. Item:\n{{FENCED_ITEM}}\nRules: be neutral.';
+const TEMPLATES = {
+  rss: TEMPLATE,
+  topics: 'Write about: {{TOPIC}}. Max {{MAX_TAGS}} tags.',
+  imagedir: 'Caption the attached image. Max {{MAX_TAGS}} tags.',
+};
 
 function candidate(over: Partial<Candidate> = {}): Candidate {
   return {
@@ -58,17 +63,26 @@ function sourceOf(...items: Candidate[]): Source {
 }
 
 /** Provider stub returning a fixed result and recording the prompts it saw. */
-function providerStub(result: ComposeResult): { provider: AiProvider; prompts: string[] } {
+function providerStub(result: ComposeResult): {
+  provider: AiProvider;
+  prompts: string[];
+  images: Array<{ mimeType: string; bytes: number }>;
+} {
   const prompts: string[] = [];
+  const images: Array<{ mimeType: string; bytes: number }> = [];
   const provider: AiProvider = {
     id: 'anthropic',
     model: 'stub',
+    supportsVision: true,
     compose: async (req) => {
       prompts.push(req.prompt);
+      if (req.image !== undefined) {
+        images.push({ mimeType: req.image.mimeType, bytes: req.image.data.byteLength });
+      }
       return result;
     },
   };
-  return { provider, prompts };
+  return { provider, prompts, images };
 }
 
 const OK_RESULT: ComposeResult = {
@@ -98,7 +112,7 @@ function deps(over: Partial<Parameters<typeof runOnce>[0]> = {}) {
     queue: PostQueue.load(queuePath),
     publisher: publisherStub({ status: 'published', msgId: 'abc' }).pub,
     provider: providerStub(OK_RESULT).provider,
-    template: TEMPLATE,
+    templates: TEMPLATES,
     ...over,
   };
 }
@@ -144,7 +158,7 @@ describe('truncateTitle', () => {
 describe('composeWithAi', () => {
   it('renders the template with the candidate fields', async () => {
     const { provider, prompts } = providerStub(OK_RESULT);
-    await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    await composeWithAi(candidate(), CONFIG, provider, TEMPLATES);
     expect(prompts[0]).toContain('Fed holds rates steady');
     expect(prompts[0]).toContain('Example Wire');
     expect(prompts[0]).toContain('The central bank left rates unchanged.');
@@ -154,7 +168,7 @@ describe('composeWithAi', () => {
     // Models reword URLs; a mangled source link is worse than none, so the
     // link is added after composition.
     const { provider } = providerStub(OK_RESULT);
-    const out = await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    const out = await composeWithAi(candidate(), CONFIG, provider, TEMPLATES);
     expect(out.status).toBe('ok');
     const post = out.status === 'ok' ? out.post : null;
     expect(post?.content).toContain('via [Example Wire](https://example.com/a)');
@@ -163,7 +177,7 @@ describe('composeWithAi', () => {
 
   it('always carries the disclosure tag ahead of AI suggestions', async () => {
     const { provider } = providerStub(OK_RESULT);
-    const out = await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    const out = await composeWithAi(candidate(), CONFIG, provider, TEMPLATES);
     const post = out.status === 'ok' ? out.post : null;
     expect(post?.tags[0]).toBe('bot');
     expect(post?.tags).toContain('central-banking');
@@ -171,7 +185,7 @@ describe('composeWithAi', () => {
 
   it('enforces the protocol title cap even if the model ignores it', async () => {
     const { provider } = providerStub({ ...OK_RESULT, title: 'x'.repeat(400) });
-    const out = await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    const out = await composeWithAi(candidate(), CONFIG, provider, TEMPLATES);
     const post = out.status === 'ok' ? out.post : null;
     expect(new TextEncoder().encode(post!.title).length).toBeLessThanOrEqual(256);
   });
@@ -180,20 +194,20 @@ describe('composeWithAi', () => {
     // The category is what makes the operator-facing message meaningful; it
     // was previously discarded, making the documented output impossible.
     const { provider } = providerStub({ status: 'refused', category: 'cyber' });
-    const out = await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    const out = await composeWithAi(candidate(), CONFIG, provider, TEMPLATES);
     expect(out).toEqual({ status: 'refused', category: 'cyber' });
   });
 
   it('handles a candidate with no summary', async () => {
     const { provider, prompts } = providerStub(OK_RESULT);
     const bare: Candidate = { dedupKey: 'k', kind: 'rss', title: 'Headline only' };
-    await composeWithAi(bare, CONFIG, provider, TEMPLATE);
+    await composeWithAi(bare, CONFIG, provider, TEMPLATES);
     expect(prompts[0]).toContain('(no summary provided)');
   });
 
   it('fences the untrusted fields', async () => {
     const { provider, prompts } = providerStub(OK_RESULT);
-    await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    await composeWithAi(candidate(), CONFIG, provider, TEMPLATES);
     expect(prompts[0]).toMatch(/<<<UNTRUSTED_SOURCE_[A-Z0-9]+/);
     expect(prompts[0]).toMatch(/[A-Z0-9]+_UNTRUSTED_SOURCE>>>/);
   });
@@ -201,8 +215,8 @@ describe('composeWithAi', () => {
   it('uses a different fence marker each call', async () => {
     // A fixed marker would be guessable from this repo's public source.
     const { provider, prompts } = providerStub(OK_RESULT);
-    await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
-    await composeWithAi(candidate(), CONFIG, provider, TEMPLATE);
+    await composeWithAi(candidate(), CONFIG, provider, TEMPLATES);
+    await composeWithAi(candidate(), CONFIG, provider, TEMPLATES);
     const marker = (p: string) => /<<<UNTRUSTED_SOURCE_([A-Z0-9]+)/.exec(p)?.[1];
     expect(marker(prompts[0]!)).not.toBe(marker(prompts[1]!));
   });
@@ -217,7 +231,7 @@ describe('composeWithAi', () => {
       }),
       CONFIG,
       provider,
-      TEMPLATE,
+      TEMPLATES,
     );
     // Exactly one opening and one closing fence survive.
     expect(prompts[0]!.match(/UNTRUSTED_SOURCE/g)).toHaveLength(2);
@@ -233,10 +247,66 @@ describe('composeWithAi', () => {
       candidate({ summary: 'x'.repeat(5000), title: 'y'.repeat(5000) }),
       cfg,
       provider,
-      TEMPLATE,
+      TEMPLATES,
     );
     expect(prompts[0]!).toContain('[truncated]');
     expect(prompts[0]!.length).toBeLessThan(1000);
+  });
+});
+
+describe('composeWithAi — source routing', () => {
+  it('uses the topic template and does NOT fence operator text', async () => {
+    // The topic is the operator's own instruction, not remote input, so
+    // fencing it would tell the model to ignore its own configuration.
+    const { provider, prompts } = providerStub(OK_RESULT);
+    await composeWithAi(
+      { dedupKey: 't', kind: 'topics', title: 'klever ecosystem' },
+      CONFIG,
+      provider,
+      TEMPLATES,
+    );
+    expect(prompts[0]).toContain('klever ecosystem');
+    expect(prompts[0]).not.toContain('UNTRUSTED_SOURCE');
+  });
+
+  it('omits attribution on a topic post', async () => {
+    // There is no source article to credit.
+    const { provider } = providerStub(OK_RESULT);
+    const out = await composeWithAi(
+      { dedupKey: 't', kind: 'topics', title: 'a topic' },
+      CONFIG,
+      provider,
+      TEMPLATES,
+    );
+    expect(out.status === 'ok' && out.post.content).not.toContain('via [');
+  });
+
+  it('sends the image bytes for an imagedir candidate', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'newsbot-pipe-img-'));
+    try {
+      const img = join(tmp, 'p.png');
+      writeFileSync(img, Buffer.alloc(128, 0x41));
+      const { provider, images, prompts } = providerStub(OK_RESULT);
+      await composeWithAi(
+        { dedupKey: 'i', kind: 'imagedir', title: img, imagePath: img, imageMimeType: 'image/png' },
+        CONFIG,
+        provider,
+        TEMPLATES,
+      );
+      expect(images).toEqual([{ mimeType: 'image/png', bytes: 128 }]);
+      expect(prompts[0]).toContain('Caption the attached image');
+      // No untrusted text reaches an image prompt at all.
+      expect(prompts[0]).not.toContain('UNTRUSTED_SOURCE');
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('still fences an rss candidate', async () => {
+    const { provider, prompts, images } = providerStub(OK_RESULT);
+    await composeWithAi(candidate(), CONFIG, provider, TEMPLATES);
+    expect(prompts[0]).toContain('UNTRUSTED_SOURCE');
+    expect(images).toEqual([]);
   });
 });
 
@@ -335,6 +405,7 @@ describe('runOnce', () => {
     const failing: AiProvider = {
       id: 'anthropic',
       model: 'stub',
+      supportsVision: true,
       compose: async () => {
         throw new Error('context window exceeded');
       },

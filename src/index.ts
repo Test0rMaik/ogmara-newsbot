@@ -26,7 +26,9 @@ import {
 import { PostQueue } from './queue.js';
 import { runOnce, type RunOutcome } from './pipeline.js';
 import { schedule, type ScheduledJob } from './scheduler.js';
+import { ImageDirSource } from './sources/imagedir.js';
 import { RssSource } from './sources/rss.js';
+import { TopicsSource } from './sources/topics.js';
 import type { Source } from './sources/types.js';
 
 interface CliArgs {
@@ -153,6 +155,15 @@ function renderPost(post: ComposedPost, address: string): void {
   console.log(
     `Tags:    ${post.tags.length > 0 ? post.tags.map((t) => `#${t}`).join(' ') : '(none)'}`,
   );
+  if (post.attachments !== undefined && post.attachments.length > 0) {
+    for (const a of post.attachments) {
+      const note =
+        a.cid === 'dry-run-not-uploaded'
+          ? '(validated, not uploaded — dry run)'
+          : `cid ${a.cid}`;
+      console.log(`Image:   ${a.filename ?? '(unnamed)'} ${note}`);
+    }
+  }
   console.log('─'.repeat(68));
   console.log(stripControlSequences(post.content));
   console.log(`${'─'.repeat(68)}\n`);
@@ -161,6 +172,7 @@ function renderPost(post: ComposedPost, address: string): void {
 /** Build the enabled sources from config. */
 function buildSources(config: Config): Source[] {
   const sources: Source[] = [];
+
   const rss = config.sources.rss;
   if (rss.enabled) {
     if (rss.feeds.length === 0) {
@@ -176,6 +188,29 @@ function buildSources(config: Config): Source[] {
       );
     }
   }
+
+  const topics = config.sources.topics;
+  if (topics.enabled) {
+    if (topics.topics.length === 0) {
+      console.warn('Warning: sources.topics is enabled but no topics are configured.');
+    } else {
+      sources.push(
+        new TopicsSource({ topics: topics.topics, minIntervalHours: topics.minIntervalHours }),
+      );
+    }
+  }
+
+  const imagedir = config.sources.imagedir;
+  if (imagedir.enabled) {
+    if (imagedir.directories.length === 0) {
+      console.warn('Warning: sources.imagedir is enabled but no directories are configured.');
+    } else {
+      sources.push(
+        new ImageDirSource({ directories: imagedir.directories, maxBytes: imagedir.maxBytes }),
+      );
+    }
+  }
+
   return sources;
 }
 
@@ -396,7 +431,11 @@ async function run(args: CliArgs): Promise<number> {
     if (result.status === 'updated') console.log('Profile: published from config');
   }
 
-  const template = loadTemplate(effective.ai.promptPath);
+  const templates = {
+    rss: loadTemplate(effective.ai.promptPath),
+    topics: loadTemplate(effective.ai.topicPromptPath),
+    imagedir: loadTemplate(effective.ai.imagePromptPath),
+  };
 
   const sources = buildSources(effective);
   if (sources.length === 0) {
@@ -412,22 +451,55 @@ async function run(args: CliArgs): Promise<number> {
       : `Mode:    LIVE — up to ${effective.posting.maxPostsPerHour} post(s)/hour`,
   );
 
-  const deps = { config: effective, sources, ledger, queue, publisher, provider, template };
+  // Fail here rather than at the first image post: a text-only model would
+  // otherwise caption a picture it never saw, which looks like it worked.
+  if (effective.sources.imagedir.enabled && !provider.supportsVision) {
+    console.error(
+      `\nsources.imagedir is enabled but the configured model (${provider.id}/${provider.model}) ` +
+        'cannot accept images.\nUse a vision-capable model, or set ' +
+        'ai.compatibleSupportsVision: true if your local model does support them.',
+    );
+    return 2;
+  }
+
+  if (effective.sources.imagedir.enabled && !health.mediaUploads) {
+    console.error(
+      '\nsources.imagedir is enabled but the node reports media uploads are unavailable ' +
+        '(its IPFS backend is offline).\nStart IPFS on the node, or point the bot at a ' +
+        'media-capable node.',
+    );
+    return 2;
+  }
+
+  const deps = { config: effective, sources, ledger, queue, publisher, provider, templates };
 
   if (args.once) {
     reportOutcome(await runOnce(deps), publisher.address);
     return 0;
   }
 
+  // One job per enabled source, each on its own cron. They share the run
+  // pipeline, and the scheduler's overlap guard is per-job, so two sources
+  // firing on the same minute run sequentially rather than racing the ledger.
   const jobs: ScheduledJob[] = [];
-  const rss = effective.sources.rss;
-  if (rss.enabled) {
-    const job = schedule(rss.schedule, async () => {
-      console.log(`\n[${new Date().toISOString()}] rss run`);
+  const schedules: Array<{ name: string; cron: string }> = [];
+  if (effective.sources.rss.enabled) {
+    schedules.push({ name: 'rss', cron: effective.sources.rss.schedule });
+  }
+  if (effective.sources.topics.enabled) {
+    schedules.push({ name: 'topics', cron: effective.sources.topics.schedule });
+  }
+  if (effective.sources.imagedir.enabled) {
+    schedules.push({ name: 'imagedir', cron: effective.sources.imagedir.schedule });
+  }
+
+  for (const { name, cron } of schedules) {
+    const job = schedule(cron, async () => {
+      console.log(`\n[${new Date().toISOString()}] ${name} run`);
       reportOutcome(await runOnce(deps), publisher.address);
     });
     jobs.push(job);
-    console.log(`Schedule: rss "${rss.schedule}" — next ${job.nextRun()?.toISOString() ?? 'never'}`);
+    console.log(`Schedule: ${name} "${cron}" — next ${job.nextRun()?.toISOString() ?? 'never'}`);
   }
 
   console.log('\nRunning. Press Ctrl+C to stop.');

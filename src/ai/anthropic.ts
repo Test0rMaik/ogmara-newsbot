@@ -40,6 +40,7 @@ export interface AnthropicProviderOptions {
 export class AnthropicProvider implements AiProvider {
   readonly id = 'anthropic' as const;
   readonly model: string;
+  readonly supportsVision = true;
 
   readonly #client: Anthropic;
   readonly #effort: AnthropicProviderOptions['effort'];
@@ -71,7 +72,7 @@ export class AnthropicProvider implements AiProvider {
           effort: this.#effort,
           format: { type: 'json_schema', schema: composeSchema(request.maxTags) },
         },
-        messages: [{ role: 'user', content: request.prompt }],
+        messages: [{ role: 'user', content: buildContent(request) }],
       } as Anthropic.Beta.MessageCreateParamsNonStreaming);
     } catch (err) {
       throw translateAnthropicError(err);
@@ -118,6 +119,28 @@ export class AnthropicProvider implements AiProvider {
     }
     return parseComposeResult(parsed);
   }
+}
+
+/**
+ * Build the user turn, with the image first when there is one.
+ *
+ * Image-before-text is Anthropic's documented ordering for vision requests and
+ * gives noticeably better results than the reverse.
+ */
+function buildContent(request: ComposeRequest): Anthropic.Beta.BetaContentBlockParam[] {
+  const blocks: Anthropic.Beta.BetaContentBlockParam[] = [];
+  if (request.image !== undefined) {
+    blocks.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: request.image.mimeType as 'image/jpeg',
+        data: Buffer.from(request.image.data).toString('base64'),
+      },
+    });
+  }
+  blocks.push({ type: 'text', text: request.prompt });
+  return blocks;
 }
 
 /**
