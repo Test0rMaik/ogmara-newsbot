@@ -37,3 +37,12 @@ jobs:
 
       - name: Audit
         run: npm audit --audit-level=low
+
+      - name: Build Docker image
+        run: docker build -t ogmara-newsbot:ci .
+
+      - name: Smoke-test the image
+        # No wallet/API keys in CI — --help needs neither, and running it
+        # through the actual ENTRYPOINT still catches a broken COPY, a
+        # missing runtime file, or a bad `node dist/index.js` invocation.
+        run: docker run --rm ogmara-newsbot:ci --help

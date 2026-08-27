@@ -5,6 +5,51 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-08-27
+
+Docker packaging — the first slice of P6, pulled forward so the whole bot
+(including the new control panel) can be built and tested as a real
+container rather than just `npm run dev`.
+
+### Added
+
+- `Dockerfile` — multi-stage build (dev-dependency build stage, minimal
+  runtime stage), running as the base image's built-in non-root `node` user.
+  Never bakes in `config.yaml` or `.env`; both are runtime mounts.
+- `docker-compose.yml` — one-command local stack: mounts `config.yaml`
+  read-only, keeps `data/` (ledger + retry queue) in a named volume so state
+  survives a container recreate, publishes the panel port to `127.0.0.1`
+  only. Documents the one non-obvious Docker networking gotcha: the panel's
+  `bind: 127.0.0.1` default is unreachable through Docker's port publishing
+  (the connecting peer is the bridge network, never the container's own
+  loopback) — enabling the panel under Docker requires `bind: 0.0.0.0` plus
+  `adminWallets`/`allowedHosts`, which the existing config validation already
+  demands for a non-loopback bind, for exactly this reason.
+- CI now builds the image and smoke-tests it (`--help`, which needs no
+  secrets) on every push, so a broken Dockerfile fails the same way a broken
+  test does.
+
+### Security
+
+- Stripped npm, npx, corepack and the bundled yarn install from the runtime
+  image. They come from the base image but are never invoked — the
+  entrypoint runs `node dist/index.js` directly — and a vulnerability scan
+  (`trivy`) found 9 HIGH/CRITICAL CVEs (`tar`, `sigstore`, `picomatch`,
+  `brace-expansion`, `ip-address`) living entirely inside npm's own bundled
+  dependency tree at `/usr/local/lib/node_modules/npm`, never inside this
+  project's own `node_modules`. Removing the unused tooling removes the
+  vulnerable code paths along with it, rather than carrying a standing
+  scanner exception for CVEs the container can never actually reach.
+- `apk upgrade` in the runtime stage, which also cleared a HIGH-severity
+  OpenSSL CVE (`libssl3`/`libcrypto3`) that trailed the base image's own
+  patch level as of build time.
+- Verified with a live container end-to-end, not just a clean build: full
+  startup against a real (mock) node, the panel's localhost bypass, its
+  `Host`-header check, and — deliberately — the exact `X-Forwarded-For`
+  padding attack from the 0.7.0 critical finding, all behaving identically
+  inside Docker as they do running natively. `trivy` reports 0 CVEs at any
+  severity on the resulting image.
+
 ## [0.7.0] - 2026-08-27
 
 A web control panel — the operator-facing piece deferred from P3, now built

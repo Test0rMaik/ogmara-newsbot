@@ -1,0 +1,35 @@
+services:
+  newsbot:
+    build: .
+    image: ogmara-newsbot:latest
+    restart: unless-stopped
+    env_file:
+      # Copy .env.example -> .env and fill in OGMARA_WALLET_KEY + your AI
+      # provider key first. Never baked into the image (see .dockerignore).
+      - .env
+    volumes:
+      # Your real config, read-only — the bot never writes to it.
+      - ./config.yaml:/app/config.yaml:ro
+      # Ledger + retry queue must survive a container recreate.
+      - newsbot-data:/app/data
+    ports:
+      # Only reachable if panel.enabled: true in config.yaml. Left published
+      # unconditionally is fine — an unenabled panel just isn't listening.
+      #
+      # IMPORTANT if you DO enable it: panel.bind: 127.0.0.1 (the default)
+      # will NOT be reachable through this port mapping. Docker's port
+      # publishing connects to the container from its bridge network, not
+      # from the container's own loopback — so the panel must bind
+      # 0.0.0.0 to be reached at all, and its localhost-bypass therefore
+      # never applies here (the peer Docker connects from is never
+      # loopback). Set in config.yaml:
+      #   panel:
+      #     bind: 0.0.0.0
+      #     adminWallets: [klv1youroperatorwallet...]
+      #     allowedHosts: [localhost]   # matches "127.0.0.1:8787" below
+      # (the config schema already refuses a non-loopback bind with no
+      # adminWallets/allowedHosts configured, for exactly this reason)
+      - '127.0.0.1:8787:8787'
+
+volumes:
+  newsbot-data:

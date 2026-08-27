@@ -46,6 +46,26 @@ npm run dev -- --dry-run
 You should see your bot's wallet address, the node's health, and a rendered
 post. Nothing is published.
 
+### Or with Docker
+
+```bash
+git clone https://github.com/Test0rMaik/ogmara-newsbot
+cd ogmara-newsbot
+
+cp config.example.yaml config.yaml   # edit: node URL, network
+cp .env.example .env                 # add your bot wallet key
+chmod 600 .env
+
+docker compose up --build
+```
+
+Same config files, same `data/` ledger — just containerized. `config.yaml` is
+mounted read-only and `data/` lives in a named volume, so neither disappears
+on a rebuild. If you enable the control panel (`panel.enabled: true`), see the
+networking note in `docker-compose.yml` first: its `bind: 127.0.0.1` default
+is unreachable through Docker's port publishing, for a reason worth
+understanding before you widen it.
+
 ## Wallet safety
 
 **Use a wallet dedicated to this bot.** The key in `.env` *is* the identity
@@ -309,7 +329,7 @@ npm run build                     # compile to dist/
 | P3 | Topic source, image-directory source, media upload | **done** |
 | P4 | Rate-limit backoff, retries | **done** (in the 0.4.0 audit pass) |
 | P5 | Web control panel (display name, wallet registration, wallet-signature login) | **done** |
-| P6 | Docker, full docs, v1.0.0 | planned |
+| P6 | Docker (**done**), full docs, v1.0.0 | in progress |
 
 ## Posting responsibly
 
