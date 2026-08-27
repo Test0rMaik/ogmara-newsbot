@@ -9,9 +9,16 @@
 
 import { statSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
+import { WalletSigner } from '@ogmara/sdk';
 import { config as loadDotenv } from 'dotenv';
 import { AiConfigError, createProvider } from './ai/index.js';
 import { loadTemplate } from './ai/prompt.js';
+import {
+  ensureConfigFile,
+  ensureWalletKey,
+  readWalletKeyFromFile,
+  type WalletBootstrapResult,
+} from './bootstrap.js';
 import { ConfigError, loadConfig, loadSecrets, type Config, type Secrets } from './config.js';
 import { applyProfile, checkRegistration, registerWallet } from './identity.js';
 import { KleverError, REGISTRATION_COST_KLV } from './klever.js';
@@ -33,6 +40,7 @@ import { ImageDirSource } from './sources/imagedir.js';
 import { RssSource } from './sources/rss.js';
 import { TopicsSource } from './sources/topics.js';
 import type { Source } from './sources/types.js';
+import { WALLET_BACKUP_PATH, acknowledgeBackup, isBackupPending } from './walletBackup.js';
 
 interface CliArgs {
   configPath: string;
@@ -47,6 +55,8 @@ interface CliArgs {
   /** Skip the interactive confirmation on --register. For scripted use. */
   assumeYes: boolean;
   showHelp: boolean;
+  /** Scaffold config.yaml / generate a wallet key, then exit. Never overwrites either. */
+  init: boolean;
 }
 
 function parseArgs(argv: readonly string[]): CliArgs {
@@ -58,6 +68,7 @@ function parseArgs(argv: readonly string[]): CliArgs {
     register: false,
     assumeYes: false,
     showHelp: false,
+    init: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -67,6 +78,7 @@ function parseArgs(argv: readonly string[]): CliArgs {
     else if (arg === '--once') args.once = true;
     else if (arg === '--set-profile') args.setProfile = true;
     else if (arg === '--register') args.register = true;
+    else if (arg === '--init') args.init = true;
     else if (arg === '--yes' || arg === '-y') args.assumeYes = true;
     else if (arg === '--config') {
       const next = argv[i + 1];
@@ -91,6 +103,14 @@ Options:
   --config <path>   Config file to use (default: config.yaml)
   --dry-run         Compose and print without publishing, overriding config
   -h, --help        Show this help
+
+First run:
+  --init            Create config.yaml (from config.example.yaml) and, if run
+                    interactively, offer to generate a wallet key — then
+                    exit so you can review both before running for real.
+                    Never overwrites an existing config.yaml or key. Also
+                    runs automatically (without needing this flag) whenever
+                    config.yaml is missing or no wallet key is configured.
 
 Identity:
   --set-profile     Publish the display name / bio from your config, then exit
@@ -266,23 +286,47 @@ function reportOutcome(outcome: RunOutcome, address: string): void {
   }
 }
 
+/** Longest a `confirm()` prompt waits before treating silence as "no". */
+const CONFIRM_TIMEOUT_MS = 5 * 60_000;
+
 /**
- * Ask the operator to confirm an irreversible, money-spending action.
+ * Ask the operator to confirm a consequential action (spending KLV,
+ * generating a wallet key).
  *
- * Returns false on a non-TTY (cron, systemd, a pipe) rather than assuming
- * consent — an unattended process must never spend funds because nobody was
- * there to say no. Scripted callers opt in explicitly with --yes.
+ * Returns false rather than assuming consent whenever nobody can plausibly
+ * be there to answer:
+ * - Neither stdin nor stdout is a TTY (cron, systemd, a pipe). Checking
+ *   both, not just stdin, matters — a session with input attached but output
+ *   redirected elsewhere (or vice versa) is exactly as unattended as one
+ *   with neither, and treating it as interactive would print a prompt that
+ *   silently blocks forever with nobody able to see or answer it.
+ * - The prompt sits unanswered for {@link CONFIRM_TIMEOUT_MS}: a TTY can be
+ *   attached to a session nobody is actually watching (a detached tmux pane,
+ *   an `-it` container under a restart policy), and a wallet-generation or
+ *   fund-spending prompt must eventually give up rather than wedge the
+ *   process indefinitely.
+ *
+ * Scripted callers opt in explicitly with --yes rather than relying on this.
  */
 async function confirm(question: string): Promise<boolean> {
-  if (!process.stdin.isTTY) {
-    console.error('Not an interactive terminal — refusing to assume consent. Re-run with --yes.');
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error('Not an interactive terminal — refusing to assume consent.');
     return false;
   }
   const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CONFIRM_TIMEOUT_MS);
   try {
-    const answer = await rl.question(`${question} [y/N] `);
+    const answer = await rl.question(`${question} [y/N] `, { signal: controller.signal });
     return /^y(es)?$/i.test(answer.trim());
+  } catch (err) {
+    if (controller.signal.aborted) {
+      console.error('\nNo response — assuming no.');
+      return false;
+    }
+    throw err;
   } finally {
+    clearTimeout(timer);
     rl.close();
   }
 }
@@ -593,6 +637,8 @@ async function startControlPanel(
     registerWallet,
     allowedHosts: config.panel.allowedHosts,
     requireLogin: config.panel.requireLogin,
+    isWalletBackupPending: () => isBackupPending(WALLET_BACKUP_PATH),
+    acknowledgeWalletBackup: () => acknowledgeBackup(WALLET_BACKUP_PATH),
   });
 
   console.log(
@@ -608,6 +654,98 @@ async function startControlPanel(
     );
   }
   return panel;
+}
+
+/**
+ * First-run convenience: scaffold `config.yaml` if it's missing, and — only
+ * when a human is actually present to see and back it up — offer to
+ * generate a wallet key if none is configured.
+ *
+ * @returns whether a summary was printed. When true, the caller should stop
+ *          here: either something was just created (worth reviewing before
+ *          a real run) or `--init` was passed explicitly as a status check.
+ */
+async function runBootstrap(args: CliArgs): Promise<boolean> {
+  const configCreated = ensureConfigFile(args.configPath);
+
+  const currentKey = process.env['OGMARA_WALLET_KEY'];
+  const alreadyConfigured = currentKey !== undefined && currentKey.trim() !== '';
+
+  let walletResult: WalletBootstrapResult = { generated: false };
+  if (!alreadyConfigured) {
+    // `--init` is itself the explicit ask; a bare run at a real terminal
+    // still confirms first, since generating a wallet mints a real identity
+    // and shouldn't happen as a side effect nobody consciously agreed to.
+    // Neither path is taken for an unattended process (no TTY, no --init) —
+    // that keeps today's behavior (a clear ConfigError) exactly as it was.
+    const shouldGenerate =
+      args.init ||
+      (process.stdin.isTTY === true &&
+        (await confirm('No wallet key is configured for this bot. Generate a new one now?')));
+    if (shouldGenerate) {
+      walletResult = await ensureWalletKey('.env', currentKey, WALLET_BACKUP_PATH);
+    }
+  }
+
+  const hasNews = configCreated || walletResult.generated || walletResult.writeError !== undefined;
+  if (!hasNews && !args.init) return false;
+
+  console.log('');
+  console.log(
+    configCreated
+      ? `Created ${args.configPath} from config.example.yaml — edit it before running for real.`
+      : `${args.configPath} already exists.`,
+  );
+
+  if (walletResult.writeError !== undefined) {
+    // Deliberately no key material here — see bootstrap.ts's WalletBootstrapResult
+    // doc comment for why a freshly generated, unfunded key is discarded
+    // rather than printed as a "last resort".
+    console.log(
+      `\nCould not save a new wallet key to "${walletResult.writeError.path}": ` +
+        `${walletResult.writeError.message}`,
+    );
+    console.log('Fix that (permissions, disk space, path exists), then run --init again.');
+  } else if (walletResult.generated) {
+    console.log(`\nGenerated a new bot wallet: ${walletResult.address}`);
+    console.log('Saved to .env.');
+    console.log(
+      '\n*** BACK UP YOUR .env FILE. This key is the only copy of this identity and\n' +
+        '*** cannot be recovered if lost — anyone who obtains it can post as this\n' +
+        '*** bot. The control panel will keep reminding you until you confirm the\n' +
+        '*** backup there (panel.enabled: true).',
+    );
+  } else {
+    // `process.env` can disagree with the file — that disagreement is
+    // exactly what ensureWalletKey guards against (see bootstrap.ts's module
+    // comment), and it means `alreadyConfigured` alone isn't trustworthy for
+    // reporting either. Fall back to reading the file directly before ever
+    // telling the operator "no key configured", so a refused-but-safe
+    // generation attempt (the whole point of that guard) can't ALSO look
+    // like the key went missing.
+    const fileKey = alreadyConfigured ? currentKey : readWalletKeyFromFile('.env');
+    if (fileKey !== undefined) {
+      let address = 'unknown — check OGMARA_WALLET_KEY';
+      try {
+        address = (await WalletSigner.fromHex(fileKey)).address;
+      } catch {
+        // Leave the placeholder; loadSecrets will explain the real problem
+        // in detail the next time something actually needs the key.
+      }
+      console.log(`\nWallet key already configured (${address}).`);
+    } else {
+      console.log(
+        '\nNo wallet key configured yet. Run this again from a terminal to be asked, ' +
+          'or set OGMARA_WALLET_KEY in .env yourself.',
+      );
+    }
+  }
+
+  console.log(
+    `\nNext: edit ${args.configPath} (enable at least one source under sources:), ` +
+      'add an AI provider key to .env, then run again.',
+  );
+  return true;
 }
 
 async function main(): Promise<void> {
@@ -629,6 +767,8 @@ async function main(): Promise<void> {
   }
 
   try {
+    if (await runBootstrap(args)) return;
+
     if (args.setProfile || args.register) {
       const config = loadConfig(args.configPath);
       const secrets = loadSecrets();

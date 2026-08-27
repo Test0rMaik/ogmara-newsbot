@@ -36,10 +36,17 @@ git clone https://github.com/Test0rMaik/ogmara-newsbot
 cd ogmara-newsbot
 npm install
 
-cp config.example.yaml config.yaml   # edit: node URL, network
-cp .env.example .env                 # add your bot wallet key
-chmod 600 .env
+npm run dev -- --init
+```
 
+`--init` creates `config.yaml` from the example, and — since it's running at a
+real terminal — offers to generate a wallet key for you (or set `OGMARA_WALLET_KEY`
+in `.env` yourself if you'd rather supply your own). It never overwrites either
+file if you already have them, so it's always safe to run again as a status
+check. Then edit `config.yaml` (node URL, network, enable at least one
+source), add an AI provider key to `.env`, and:
+
+```bash
 npm run dev -- --dry-run
 ```
 
@@ -51,20 +58,21 @@ post. Nothing is published.
 ```bash
 git clone https://github.com/Test0rMaik/ogmara-newsbot
 cd ogmara-newsbot
+npm install
+npm run dev -- --init          # generates config.yaml + .env on the host
 
-cp config.example.yaml config.yaml   # edit: node URL, network
-cp .env.example .env                 # add your bot wallet key
-chmod 600 .env
-
+# edit config.yaml, add an AI key to .env, then:
 docker compose up --build
 ```
 
-Same config files, same `data/` ledger — just containerized. `config.yaml` is
-mounted read-only and `data/` lives in a named volume, so neither disappears
-on a rebuild. If you enable the control panel (`panel.enabled: true`), see the
-networking note in `docker-compose.yml` first: its `bind: 127.0.0.1` default
-is unreachable through Docker's port publishing, for a reason worth
-understanding before you widen it.
+`--init` needs to run on the host first (once) — Docker's bind mount expects
+`config.yaml` and `.env` to already exist before the container starts.
+Afterward, same files, same `data/` ledger — just containerized.
+`config.yaml` is mounted read-only and `data/` lives in a named volume, so
+neither disappears on a rebuild. If you enable the control panel
+(`panel.enabled: true`), see the networking note in `docker-compose.yml`
+first: its `bind: 127.0.0.1` default is unreachable through Docker's port
+publishing, for a reason worth understanding before you widen it.
 
 ## Wallet safety
 
@@ -72,7 +80,18 @@ understanding before you widen it.
 every post is attributed to — anyone holding it can post as your bot. Never use
 a wallet that holds funds you care about.
 
-`.env` is gitignored. Keep it that way, and `chmod 600` it.
+`.env` is gitignored. Keep it that way, and `chmod 600` it (`--init` does this
+for you automatically).
+
+If you let `--init` generate a wallet, **back it up before doing anything
+else** — copy `.env` somewhere safe. This key is the only copy of that
+identity; if it's lost, it's gone, and if it's ever funded, so is the KLV.
+Generation is never silent or automatic on an unattended run (cron, systemd,
+a restarting container) specifically to avoid minting a key nobody notices —
+it only happens when you explicitly ask (`--init`) or confirm at a real
+terminal prompt. Once generated, the control panel (`panel.enabled: true`)
+shows a reminder banner on every visit until you confirm you've backed it up,
+since a one-time terminal message is easy to miss entirely.
 
 You do **not** need to register the wallet on-chain to post news. Unregistered
 wallets can publish; the node will make your bot solve a one-time proof-of-work
@@ -305,6 +324,7 @@ Queued posts are published before anything new is composed. They expire after
 ## Commands
 
 ```bash
+npm run dev -- --init             # scaffold config.yaml / generate a wallet key, then exit
 npm run dev -- --once --dry-run   # one run, compose and print, never publish
 npm run dev -- --once             # one run (for cron / systemd timers)
 npm run dev                       # run on the configured schedule

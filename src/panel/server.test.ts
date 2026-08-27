@@ -67,6 +67,7 @@ interface StartOptions {
   registerWallet?: PanelDeps['registerWallet'];
   allowedHosts?: string[];
   requireLogin?: boolean;
+  walletBackupPending?: boolean;
 }
 
 async function start(options: StartOptions = {}): Promise<{
@@ -77,6 +78,7 @@ async function start(options: StartOptions = {}): Promise<{
     checkRegistration: ReturnType<typeof vi.fn>;
     applyProfile: ReturnType<typeof vi.fn>;
     registerWallet: ReturnType<typeof vi.fn>;
+    acknowledgeWalletBackup: ReturnType<typeof vi.fn>;
   };
 }> {
   const auth = new PanelAuth({
@@ -101,6 +103,13 @@ async function start(options: StartOptions = {}): Promise<{
       })),
   );
 
+  // In-memory stand-in for walletBackup.ts's file-backed state, mutated by
+  // the ack endpoint exactly like the real one would be.
+  let backupPending = options.walletBackupPending ?? false;
+  const acknowledgeWalletBackupFn = vi.fn(() => {
+    backupPending = false;
+  });
+
   const deps: PanelDeps = {
     auth,
     trustedProxies: new TrustedProxies(options.trustedProxyCidrs ?? []),
@@ -117,6 +126,8 @@ async function start(options: StartOptions = {}): Promise<{
     registerWallet: registerWalletFn,
     allowedHosts: options.allowedHosts ?? [],
     requireLogin: options.requireLogin ?? false,
+    isWalletBackupPending: () => backupPending,
+    acknowledgeWalletBackup: acknowledgeWalletBackupFn,
   };
 
   const started = await startPanel('127.0.0.1', 0, deps);
@@ -125,7 +136,12 @@ async function start(options: StartOptions = {}): Promise<{
     panel: started,
     baseUrl: `http://127.0.0.1:${started.port}`,
     auth,
-    fns: { checkRegistration: checkRegistrationFn, applyProfile: applyProfileFn, registerWallet: registerWalletFn },
+    fns: {
+      checkRegistration: checkRegistrationFn,
+      applyProfile: applyProfileFn,
+      registerWallet: registerWalletFn,
+      acknowledgeWalletBackup: acknowledgeWalletBackupFn,
+    },
   };
 }
 
@@ -325,6 +341,18 @@ describe('/api/status error mapping', () => {
     });
     const res = await fetch(`${baseUrl}/api/status`);
     expect(res.status).toBe(502);
+  });
+
+  it('still reports walletBackupPending on a 502 — a chain outage must not hide the backup reminder', async () => {
+    const { baseUrl } = await start({
+      walletBackupPending: true,
+      checkRegistration: async () => {
+        throw new Error('rpc unreachable');
+      },
+    });
+    const res = await fetch(`${baseUrl}/api/status`);
+    expect(res.status).toBe(502);
+    expect((await json(res)).walletBackupPending).toBe(true);
   });
 
   it('reports the unregistered tier and affordability', async () => {
@@ -598,5 +626,51 @@ describe('loopback bypass — forwarding-header presence gate', () => {
     const { baseUrl } = await start({ trustedProxyCidrs: ['10.0.0.0/8'] });
     const res = await fetch(`${baseUrl}/api/status`);
     expect(res.status).toBe(200);
+  });
+});
+
+describe('wallet backup reminder', () => {
+  it('reports pending when a generated key has not been acknowledged', async () => {
+    const { baseUrl } = await start({ walletBackupPending: true });
+    const body = await json(await fetch(`${baseUrl}/api/status`));
+    expect(body.walletBackupPending).toBe(true);
+  });
+
+  it('reports not pending for a manually supplied key', async () => {
+    const { baseUrl } = await start({ walletBackupPending: false });
+    const body = await json(await fetch(`${baseUrl}/api/status`));
+    expect(body.walletBackupPending).toBe(false);
+  });
+
+  it('acknowledging clears it for subsequent status checks', async () => {
+    const { baseUrl, fns } = await start({ walletBackupPending: true });
+    const ackRes = await fetch(`${baseUrl}/api/wallet/ack-backup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    expect(ackRes.status).toBe(200);
+    expect(fns.acknowledgeWalletBackup).toHaveBeenCalledTimes(1);
+
+    const body = await json(await fetch(`${baseUrl}/api/status`));
+    expect(body.walletBackupPending).toBe(false);
+  });
+
+  it('requires authentication for a non-local caller', async () => {
+    const { baseUrl, fns } = await start({ walletBackupPending: true });
+    const res = await fetch(`${baseUrl}/api/wallet/ack-backup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '203.0.113.9' },
+      body: '{}',
+    });
+    expect(res.status).toBe(401);
+    expect(fns.acknowledgeWalletBackup).not.toHaveBeenCalled();
+  });
+
+  it('requires Content-Type: application/json like every other mutating route', async () => {
+    const { baseUrl, fns } = await start({ walletBackupPending: true });
+    const res = await fetch(`${baseUrl}/api/wallet/ack-backup`, { method: 'POST' });
+    expect(res.status).toBe(415);
+    expect(fns.acknowledgeWalletBackup).not.toHaveBeenCalled();
   });
 });

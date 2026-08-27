@@ -10,8 +10,22 @@ services:
     volumes:
       # Your real config, read-only — the bot never writes to it.
       - ./config.yaml:/app/config.yaml:ro
-      # Ledger + retry queue must survive a container recreate.
-      - newsbot-data:/app/data
+      # Bind-mounted (not a named volume) deliberately: `npm run dev -- --init`
+      # on the host writes the ledger, queue and wallet-backup-reminder state
+      # into ./data. A named volume is a SEPARATE, Docker-managed store the
+      # container would see instead — so if the host's `--init` had generated
+      # a wallet key, the control panel's backup-reminder banner would never
+      # appear in the container (its state file would simply not exist from
+      # the container's point of view), and the ledger clean run you may have
+      # tested with `--once --dry-run` on the host wouldn't carry over either.
+      #
+      # Unlike a named volume, a bind mount keeps the HOST's ownership — the
+      # container runs as uid 1000 ("node"), which is also the first regular
+      # user on most Linux distros, so this usually just works. If you see a
+      # permission error writing to data/, either `chown -R 1000:1000 data/`
+      # on the host once, or add `user: "$(id -u):$(id -g)"` below to match
+      # your own account instead.
+      - ./data:/app/data
     ports:
       # Only reachable if panel.enabled: true in config.yaml. Left published
       # unconditionally is fine — an unenabled panel just isn't listening.
@@ -30,6 +44,3 @@ services:
       # (the config schema already refuses a non-loopback bind with no
       # adminWallets/allowedHosts configured, for exactly this reason)
       - '127.0.0.1:8787:8787'
-
-volumes:
-  newsbot-data:

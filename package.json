@@ -1,6 +1,6 @@
 {
   "name": "ogmara-newsbot",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Self-hostable bot that publishes AI-composed posts to the Ogmara News Feed",
   "type": "module",
   "bin": {

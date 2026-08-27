@@ -5,6 +5,84 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-08-27
+
+First-run convenience: no more manually copying config files or generating a
+wallet key by hand.
+
+### Added
+
+- **`--init`** — creates `config.yaml` from `config.example.yaml` and, when
+  run at a real terminal, offers to generate a wallet key. Never overwrites
+  either file, so it's always safe to re-run as a status check (shows the
+  existing wallet's address if one is already configured). Also runs
+  automatically, without needing the flag, whenever `config.yaml` is missing
+  — a bare `npm run dev` on a fresh clone now scaffolds a config instead of
+  just failing with "file not found".
+- **Wallet generation is gated, deliberately.** Creating `config.yaml` is
+  harmless and happens unconditionally; generating a wallet key mints a real,
+  persistent Klever identity, so it only ever happens on explicit ask
+  (`--init`) or an interactive confirmation at a real terminal — never as a
+  side effect of an unattended process starting (cron, systemd, a container
+  restarting after a misconfiguration). An unattended run with no key
+  configured behaves exactly as before: a clear, immediate `ConfigError`. The
+  confirmation prompt itself requires both stdin AND stdout to be a real
+  terminal and times out after 5 minutes of silence (treated as "no") — a TTY
+  can be attached to a session nobody is actually watching (a detached tmux
+  pane, an `-it` container under a restart policy), and this must never wedge
+  the process waiting on an answer that will never come.
+- **The file is the only authority on whether a key already exists — never
+  the environment.** This sounds like an implementation detail, but it's the
+  load-bearing safety property of the whole feature: `dotenv` resolves
+  duplicate `OGMARA_WALLET_KEY=` lines last-wins, so naively trusting
+  `process.env` would let an operator destroy a real, possibly-funded key by
+  something as ordinary as pasting a fresh `.env.example` onto the end of
+  their real `.env` instead of editing the line in place (the trailing empty
+  placeholder line "wins" and looks like "no key configured"), or by a
+  parent shell/systemd unit that merely has `OGMARA_WALLET_KEY=` present in
+  its environment as an empty string (`dotenv` treats a present-but-empty
+  variable as already "set" and never reads the file for it at all). Both
+  are realistic mistakes, not contrived ones. So this reads and parses the
+  actual `.env` file — with the real `dotenv` parser, so the check can never
+  disagree with what the file will actually load as — and checks every
+  matching line for a real value, not just whichever one `dotenv` would
+  resolve to. Only ever refuses to touch a real key; never partially
+  "fixes" one.
+- Locked around the read-check-write sequence (the same primitive `lock.ts`
+  already uses for the ledger), so two overlapping invocations — a
+  double-clicked `--init`, a stray second terminal — can't both observe "no
+  key yet" and both generate one, silently orphaning whichever loses the
+  race. Also refuses outright while a real bot instance is already running
+  in the same directory, which is exactly when touching `.env` is riskiest.
+- The `.env` write itself is atomic (temp file + rename) rather than an
+  in-place rewrite, so a crash mid-write can never truncate an existing
+  `.env` and lose every other secret in it.
+- If a generated key can't be persisted (e.g. a read-only filesystem), it is
+  discarded rather than printed to the terminal as a fallback — the key at
+  that point is brand new, unfunded, and has never signed anything, so
+  losing it costs nothing next to what printing a private key could cost if
+  that output is ever captured (a systemd journal, CI logs, a recorded
+  terminal session). The operator just fixes whatever blocked the write and
+  runs `--init` again.
+- **Persistent backup reminder in the control panel.** A one-time terminal
+  message at generation time is easy to miss — it can scroll past, or land in
+  logs nobody is watching at that exact moment. So generating a key now also
+  records that its backup is unconfirmed (`data/wallet-backup.json`), and the
+  panel shows a reminder banner on every visit until the operator explicitly
+  confirms (`POST /api/wallet/ack-backup`, authenticated like every other
+  panel action). Only ever set for a bot-generated key — a key you supplied
+  yourself is presumably already backed up wherever you keep it, so no
+  reminder appears for that case. The reminder survives a node/chain outage
+  too: `/api/status` reports it even on its own 502 responses, so an
+  unrelated failure can't make the one durable reminder disappear along with
+  everything else.
+- `docker-compose.yml`'s `data/` mount is now a bind mount (`./data:/app/data`)
+  rather than a Docker-managed named volume — a named volume is a separate
+  store the container would see instead of the host's `./data`, which meant
+  running `--init` on the host (as documented) left the container unable to
+  see the wallet-backup reminder state, or the ledger from a host-side
+  `--once --dry-run` test, at all.
+
 ## [0.8.0] - 2026-08-27
 
 Docker packaging — the first slice of P6, pulled forward so the whole bot

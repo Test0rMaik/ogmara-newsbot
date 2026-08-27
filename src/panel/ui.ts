@@ -40,6 +40,8 @@ export function renderPage(ctx: PageContext): string {
   h1 { font-size: 1.2rem; }
   .muted { color: #9aa0a8; font-size: 0.85rem; }
   .card { background: #1c1f27; border: 1px solid #2a2e38; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  .banner { background: #3a2a12; border: 1px solid #a86a1e; border-radius: 8px; padding: 1rem;
+            margin: 0 0 1rem; color: #ffd9a0; }
   button { background: #3a6ff7; color: white; border: none; border-radius: 6px; padding: 0.5rem 1rem;
            cursor: pointer; font-size: 0.95rem; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -61,6 +63,14 @@ export function renderPage(ctx: PageContext): string {
     <p>Sign in with the wallet authorised to operate this bot.</p>
     <button id="login-btn">Connect wallet</button>
     <p id="error"></p>
+  </div>
+
+  <div id="backup-banner" class="banner" hidden>
+    <strong>Back up your wallet key now.</strong> This bot's wallet key was
+    generated automatically, and its only copy is the <code>.env</code> file
+    on this machine — it cannot be recovered if lost, and anyone who obtains
+    it can post as this bot. Copy it somewhere safe now.
+    <p><button id="backup-ack-btn">I've backed it up</button></p>
   </div>
 
   <div id="panel" class="card" hidden>
@@ -99,6 +109,7 @@ export function renderScript(): string {
 const errorEl = document.getElementById('error');
 const loginCard = document.getElementById('login-card');
 const panel = document.getElementById('panel');
+const backupBanner = document.getElementById('backup-banner');
 
 function showError(message) {
   errorEl.textContent = message;
@@ -111,11 +122,14 @@ async function api(path, options) {
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    // status carried on the error so callers can tell "not logged in" (401)
-    // apart from every other failure — refresh() relies on this to avoid
-    // showing "please sign in" when the real problem is an unreachable chain.
+    // status AND body carried on the error: refresh() needs the status code
+    // to tell "not logged in" (401) apart from every other failure, and the
+    // body itself because /api/status still includes walletBackupPending on
+    // a 502 (chain unreachable) precisely so a node outage can't make the
+    // backup reminder disappear along with everything else in the response.
     const err = new Error(body.error || ('request failed: ' + res.status));
     err.status = res.status;
+    err.body = body;
     throw err;
   }
   return body;
@@ -153,6 +167,7 @@ async function logout() {
   await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
   loginCard.hidden = false;
   panel.hidden = true;
+  backupBanner.hidden = true;
 }
 
 function setField(dl, label, value) {
@@ -165,9 +180,29 @@ function setField(dl, label, value) {
 }
 
 async function refresh() {
-  const status = await api('/api/status', { method: 'GET' });
+  let status;
+  try {
+    status = await api('/api/status', { method: 'GET' });
+  } catch (err) {
+    if (err.status === 401) {
+      loginCard.hidden = false;
+      panel.hidden = true;
+      backupBanner.hidden = true;
+      throw err;
+    }
+    // Authenticated, but something else failed (most likely the chain being
+    // unreachable) — still worth showing the panel shell and the backup
+    // reminder rather than leaving the operator looking at the login screen
+    // as if they were never signed in. /api/status includes
+    // walletBackupPending even on its error responses for exactly this.
+    loginCard.hidden = true;
+    panel.hidden = false;
+    backupBanner.hidden = !(err.body && err.body.walletBackupPending);
+    throw err;
+  }
   loginCard.hidden = true;
   panel.hidden = false;
+  backupBanner.hidden = !status.walletBackupPending;
   document.getElementById('whoami').textContent = status.authenticatedAs;
 
   const dl = document.getElementById('status');
@@ -226,10 +261,23 @@ async function register() {
   }
 }
 
+async function ackBackup() {
+  const btn = document.getElementById('backup-ack-btn');
+  btn.disabled = true;
+  try {
+    await api('/api/wallet/ack-backup', { method: 'POST', body: '{}' });
+    backupBanner.hidden = true;
+  } catch (err) {
+    showError(err.message || String(err));
+    btn.disabled = false;
+  }
+}
+
 document.getElementById('login-btn').addEventListener('click', login);
 document.getElementById('logout-btn').addEventListener('click', logout);
 document.getElementById('profile-btn').addEventListener('click', updateProfile);
 document.getElementById('register-btn').addEventListener('click', register);
+document.getElementById('backup-ack-btn').addEventListener('click', ackBackup);
 
 // If a session cookie is already valid (page reload, or localhost bypass),
 // the status call succeeds immediately and skips the login screen. A 401

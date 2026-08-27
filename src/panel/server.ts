@@ -65,6 +65,15 @@ export interface PanelDeps {
    * X-Forwarded-For (undetectable from the HTTP side — see clientip.ts).
    */
   requireLogin: boolean;
+  /**
+   * Whether a bot-generated wallet key is still awaiting the operator's
+   * backup confirmation (see `walletBackup.ts`). Surfaced on `/api/status`
+   * so the UI can keep showing a reminder banner across restarts — a
+   * one-time terminal message at generation time is easy to miss entirely.
+   */
+  isWalletBackupPending: () => boolean;
+  /** Record that the operator has confirmed the backup. */
+  acknowledgeWalletBackup: () => void;
 }
 
 /** Per-instance mutable state, kept out of PanelDeps because it isn't config. */
@@ -267,12 +276,22 @@ async function handle(
   }
 
   if (method === 'GET' && path === '/api/status') {
+    // Computed before the chain call and included in BOTH outcomes below —
+    // this has no network dependency, and the backup reminder exists
+    // specifically to survive things going wrong (see walletBackup.ts). A
+    // node/chain outage must not be able to silently suppress the one
+    // durable reminder that a freshly generated key still needs backing up.
+    const walletBackupPending = deps.isWalletBackupPending();
+    const authenticatedAs = sessionAddress ?? 'localhost';
+
     let registration;
     try {
       registration = await deps.checkRegistration(deps.network, deps.botAddress);
     } catch (err) {
       sendJson(res, 502, {
         error: `could not reach the chain: ${err instanceof Error ? err.message : String(err)}`,
+        walletBackupPending,
+        authenticatedAs,
       });
       return;
     }
@@ -287,8 +306,21 @@ async function handle(
       balanceKlv: registration.balanceKlv,
       canAffordRegistration: registration.canAfford,
       registrationCostKlv: REGISTRATION_COST_KLV,
-      authenticatedAs: sessionAddress ?? 'localhost',
+      authenticatedAs,
+      walletBackupPending,
     });
+    return;
+  }
+
+  if (method === 'POST' && path === '/api/wallet/ack-backup') {
+    if (!requireJsonContentType(req, res)) return;
+    // No body fields needed — reading one anyway keeps this consistent with
+    // every other mutating route (JSON-only, size-capped) rather than being
+    // the one exception a future change could silently regress.
+    const body = await readJsonBody<Record<string, never>>(req, res);
+    if (body === undefined) return;
+    deps.acknowledgeWalletBackup();
+    sendJson(res, 200, { ok: true });
     return;
   }
 
