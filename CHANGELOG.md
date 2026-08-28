@@ -5,6 +5,24 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-08-28
+
+### Fixed
+
+- **The dashboard's "Refresh" button (added in 0.12.0) didn't actually
+  refresh the chart** — it re-fetched `/api/stats-history`, which only ever
+  reflects whatever the periodic scheduled snapshot (every 6 hours by
+  default) last recorded on disk. Clicking Refresh right after a change
+  showed the exact same chart, with nothing indicating why. `refreshChart`
+  now takes a `force` parameter: the Refresh button calls a new
+  `POST /api/stats-history/refresh`, which triggers a live full-history
+  aggregation against the node right then and appends a fresh snapshot
+  before returning — sharing the same in-flight guard as the startup
+  snapshot and the recurring cron job, so a manual click can't race either
+  of them into double work. Plain loads (login, tab switch, initial page
+  load) still use the cheap local-file read; only an explicit click pays for
+  the heavier live call.
+
 ## [0.12.0] - 2026-08-28
 
 ### Fixed

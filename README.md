@@ -328,7 +328,11 @@ controls.
 
 The history chart needs at least two snapshots before it shows anything —
 expect an empty chart for the first `stats.schedule` interval (6 hours by
-default) after first enabling the panel.
+default) after first enabling the panel. A **Refresh** button at the top of
+the Dashboard tab reloads everything in place (posts, stats, and the chart)
+without a browser refresh — clicking it also forces a brand-new chart
+snapshot right then, rather than waiting for the next scheduled one, so it's
+the fastest way to see fresh engagement numbers on demand.
 
 The bot **always** signs with its own wallet (`OGMARA_WALLET_KEY`) — the panel
 never holds or asks for anyone else's key. `panel.adminWallets` instead names

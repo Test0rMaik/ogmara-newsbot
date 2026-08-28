@@ -547,9 +547,30 @@ async function run(args: CliArgs): Promise<number> {
   // Loaded only when the panel is on: it's the only consumer, per
   // config.ts's statsSchema comment.
   let statsHistory: StatsHistory | undefined;
+  // Takes a snapshot on demand, sharing ONE in-flight guard across every
+  // trigger source: the startup snapshot below, the recurring cron tick, and
+  // the panel's manual "Refresh" button (added after operator feedback that
+  // clicking refresh didn't actually update the chart — it only re-read
+  // whatever was already on disk). A concurrent caller joins the SAME
+  // in-flight aggregation rather than starting a second one or silently
+  // no-op'ing, so "trigger a snapshot" always means "wait until one is
+  // available," regardless of who else asked for it at the same time.
+  let takeStatsSnapshotNow: (() => Promise<void>) | undefined;
   if (effective.panel.enabled) {
     statsHistory = StatsHistory.load(effective.stats.path, effective.stats.retentionDays);
-    panel = await startControlPanel(effective, secrets, publisher, queue, statsHistory);
+    const history = statsHistory;
+    let inFlight: Promise<void> | undefined;
+    takeStatsSnapshotNow = (): Promise<void> => {
+      if (inFlight === undefined) {
+        inFlight = takeStatsSnapshot(publisher.client, publisher.address, history, effective.stats).finally(
+          () => {
+            inFlight = undefined;
+          },
+        );
+      }
+      return inFlight;
+    };
+    panel = await startControlPanel(effective, secrets, publisher, queue, statsHistory, takeStatsSnapshotNow);
   }
 
   // One job per enabled source, each on its own cron. They share the run
@@ -578,25 +599,12 @@ async function run(args: CliArgs): Promise<number> {
 
   // The dashboard's history chart, not the posting pipeline — a separate
   // cron entirely, so its cadence (and whether it runs at all) is
-  // independent of how often the bot actually posts.
-  if (statsHistory !== undefined && effective.stats.enabled) {
-    const history = statsHistory;
-    // The scheduler's own overlap guard (scheduler.ts's `running` flag) only
-    // covers cron ticks — it can't see the one-off startup snapshot below,
-    // so without this a slow first aggregation pass could still be running
-    // when the first cron tick fires, doubling node load for no benefit
-    // (two near-simultaneous snapshots of the same totals). (Code audit,
-    // 0.11.0.)
-    let snapshotInFlight = false;
-    const takeSnapshot = async (): Promise<void> => {
-      if (snapshotInFlight) return;
-      snapshotInFlight = true;
-      try {
-        await takeStatsSnapshot(publisher.client, publisher.address, history, effective.stats);
-      } finally {
-        snapshotInFlight = false;
-      }
-    };
+  // independent of how often the bot actually posts. `stats.enabled`
+  // controls only this automatic cadence — the panel's manual "Refresh"
+  // trigger (wired above, into takeStatsSnapshotNow) works regardless, since
+  // an explicit ask is different from an unattended background job.
+  if (takeStatsSnapshotNow !== undefined && effective.stats.enabled) {
+    const takeSnapshot = takeStatsSnapshotNow;
     // Fire one immediately rather than waiting for the first cron tick — a
     // freshly enabled panel would otherwise show an empty chart for up to a
     // full `stats.schedule` interval (6 hours, by default) with nothing
@@ -699,6 +707,7 @@ async function startControlPanel(
   publisher: OgmaraPublisher,
   queue: PostQueue,
   statsHistory: StatsHistory,
+  takeStatsSnapshotNow: () => Promise<void>,
 ): Promise<Panel> {
   let trustedProxies: TrustedProxies;
   try {
@@ -746,6 +755,10 @@ async function startControlPanel(
       ),
     queuedCountFn: () => queue.size,
     fetchStatsHistory: () => Promise.resolve(statsHistory.all()),
+    refreshStatsHistory: async () => {
+      await takeStatsSnapshotNow();
+      return statsHistory.all();
+    },
   });
 
   console.log(

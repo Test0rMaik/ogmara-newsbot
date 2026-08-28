@@ -339,14 +339,40 @@ describe('dashboard refresh button', () => {
   it('reloads both posts and the chart, without a full page reload', () => {
     const fn = extractFunction(script, 'refreshDashboard');
     expect(fn).toContain('refreshPosts()');
-    expect(fn).toContain('refreshChart()');
+    expect(fn).toContain('refreshChart(true)');
     expect(script).not.toContain('location.reload');
+  });
+
+  it('forces a brand-new snapshot rather than just re-reading the last one — the whole point of this button', () => {
+    // Prior behavior: clicking Refresh re-fetched /api/stats-history, which
+    // only reflects whatever the periodic (default 6h) scheduled snapshot
+    // last recorded — the chart looked unchanged even right after a click.
+    const fn = extractFunction(script, 'refreshDashboard');
+    expect(fn).toContain('refreshChart(true)');
   });
 
   it('disables itself while the refresh is in flight, and re-enables afterward even on failure', () => {
     const fn = extractFunction(script, 'refreshDashboard');
     expect(fn).toMatch(/\.disabled = true/);
     expect(fn).toMatch(/finally[\s\S]*\.disabled = false/);
+  });
+});
+
+describe('refreshChart force parameter', () => {
+  it('POSTs /api/stats-history/refresh (forcing a new snapshot) only when force is true', () => {
+    const fn = extractFunction(script, 'refreshChart');
+    expect(fn).toContain("api('/api/stats-history/refresh', { method: 'POST'");
+    expect(fn).toContain("api('/api/stats-history', { method: 'GET' }");
+  });
+
+  it('plain loads (login, tab switch, initial page load) never force a new snapshot', () => {
+    // Only the button's own handler should ever call refreshChart(true) —
+    // every routine load stays a cheap local read, since forcing a fresh
+    // node aggregation on every tab switch would be needless extra load.
+    expect(extractFunction(script, 'login')).toMatch(/refreshChart\(\);/);
+    expect(extractFunction(script, 'switchTab')).toMatch(/refreshChart\(\);/);
+    const tail = script.slice(script.lastIndexOf('refresh().catch'));
+    expect(tail).toMatch(/refreshChart\(\);/);
   });
 });
 

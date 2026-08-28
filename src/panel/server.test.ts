@@ -71,6 +71,7 @@ interface StartOptions {
   fetchPostStats?: PanelDeps['fetchPostStats'];
   queuedCount?: number;
   fetchStatsHistory?: PanelDeps['fetchStatsHistory'];
+  refreshStatsHistory?: PanelDeps['refreshStatsHistory'];
 }
 
 async function start(options: StartOptions = {}): Promise<{
@@ -84,6 +85,7 @@ async function start(options: StartOptions = {}): Promise<{
     acknowledgeWalletBackup: ReturnType<typeof vi.fn>;
     fetchPostStats: ReturnType<typeof vi.fn>;
     fetchStatsHistory: ReturnType<typeof vi.fn>;
+    refreshStatsHistory: ReturnType<typeof vi.fn>;
   };
 }> {
   const auth = new PanelAuth({
@@ -126,6 +128,7 @@ async function start(options: StartOptions = {}): Promise<{
   );
 
   const fetchStatsHistoryFn = vi.fn(options.fetchStatsHistory ?? (async () => []));
+  const refreshStatsHistoryFn = vi.fn(options.refreshStatsHistory ?? (async () => []));
 
   const deps: PanelDeps = {
     auth,
@@ -148,6 +151,7 @@ async function start(options: StartOptions = {}): Promise<{
     fetchPostStats: fetchPostStatsFn,
     queuedCountFn: () => options.queuedCount ?? 0,
     fetchStatsHistory: fetchStatsHistoryFn,
+    refreshStatsHistory: refreshStatsHistoryFn,
   };
 
   const started = await startPanel('127.0.0.1', 0, deps);
@@ -163,6 +167,7 @@ async function start(options: StartOptions = {}): Promise<{
       acknowledgeWalletBackup: acknowledgeWalletBackupFn,
       fetchPostStats: fetchPostStatsFn,
       fetchStatsHistory: fetchStatsHistoryFn,
+      refreshStatsHistory: refreshStatsHistoryFn,
     },
   };
 }
@@ -747,6 +752,68 @@ describe('/api/stats-history', () => {
     const res = await fetch(`${baseUrl}/api/stats-history`);
     expect(res.status).toBe(200);
     expect(fns.fetchStatsHistory).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('POST /api/stats-history/refresh', () => {
+  it('triggers a fresh snapshot and returns the updated history', async () => {
+    const { baseUrl } = await start({
+      refreshStatsHistory: async () => [
+        { timestamp: 1_700_000_000_000, totalReactions: 9, totalReposts: 0, totalComments: 0, totalPosts: 1 },
+      ],
+    });
+    const res = await fetch(`${baseUrl}/api/stats-history/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.snapshots).toHaveLength(1);
+    expect(body.snapshots[0].totalReactions).toBe(9);
+  });
+
+  it('maps a refresh failure (e.g. the node is unreachable) to 502 rather than crashing', async () => {
+    const { baseUrl } = await start({
+      refreshStatsHistory: async () => {
+        throw new Error('node unreachable');
+      },
+    });
+    const res = await fetch(`${baseUrl}/api/stats-history/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(502);
+  });
+
+  it('requires Content-Type: application/json, like every other mutating route', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/stats-history/refresh`, { method: 'POST', body: '{}' });
+    expect(res.status).toBe(415);
+    expect(fns.refreshStatsHistory).not.toHaveBeenCalled();
+  });
+
+  it('requires authentication for a non-local caller', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/stats-history/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '203.0.113.9' },
+      body: '{}',
+    });
+    expect(res.status).toBe(401);
+    expect(fns.refreshStatsHistory).not.toHaveBeenCalled();
+  });
+
+  it('allows the localhost bypass, same as every other route', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/stats-history/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    expect(fns.refreshStatsHistory).toHaveBeenCalledTimes(1);
   });
 });
 

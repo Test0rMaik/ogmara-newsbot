@@ -537,12 +537,23 @@ function renderChart() {
   svg.appendChild(latestLabel);
 }
 
-async function refreshChart() {
+/**
+ * @param force When true, asks the bot to take a brand-new snapshot right
+ *   now (a live full-history aggregation against the node) rather than just
+ *   re-reading whatever the last scheduled snapshot happened to record —
+ *   this is what the "Refresh" button asks for. Plain loads (login, tab
+ *   switch, initial page load) never force this: it's a genuinely heavier
+ *   call, and firing it on every routine load would put needless extra load
+ *   on the node for data that only changes meaningfully every few hours.
+ */
+async function refreshChart(force) {
   const errorEl = document.getElementById('chart-error');
   errorEl.hidden = true;
   errorEl.textContent = '';
   try {
-    const result = await api('/api/stats-history', { method: 'GET' });
+    const result = force
+      ? await api('/api/stats-history/refresh', { method: 'POST', body: '{}' })
+      : await api('/api/stats-history', { method: 'GET' });
     chartHistory = Array.isArray(result.snapshots) ? result.snapshots : [];
     renderChart();
   } catch (err) {
@@ -566,7 +577,10 @@ async function refreshDashboard() {
     // Both already catch and display their own errors internally, so
     // Promise.all here never rejects on a fetch failure — it only ever
     // rejects on a genuine bug, which should surface rather than be masked.
-    await Promise.all([refreshPosts(), refreshChart()]);
+    // refreshChart(true): an explicit click is exactly the case that should
+    // force a brand-new snapshot rather than settle for re-reading the last
+    // scheduled one — see refreshChart's doc comment.
+    await Promise.all([refreshPosts(), refreshChart(true)]);
   } finally {
     btn.disabled = false;
   }

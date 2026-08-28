@@ -87,6 +87,16 @@ export interface PanelDeps {
    * that without touching this interface.
    */
   fetchStatsHistory: () => Promise<readonly StatsSnapshot[]>;
+  /**
+   * Force a fresh snapshot right now (a full-history aggregation against the
+   * node — see `stats.ts`), then return the updated history. Unlike
+   * `fetchStatsHistory`, this genuinely can fail (it's a live node call) and
+   * can take a while (bounded by `stats.maxPostsScanned`/the aggregation
+   * deadline) — it's what the dashboard's "Refresh" button calls so the
+   * chart actually gets a new data point on demand, rather than only
+   * re-reading whatever the last scheduled snapshot happened to record.
+   */
+  refreshStatsHistory: () => Promise<readonly StatsSnapshot[]>;
 }
 
 /** Per-instance mutable state, kept out of PanelDeps because it isn't config. */
@@ -344,6 +354,21 @@ async function handle(
     } catch (err) {
       sendJson(res, 502, {
         error: `could not fetch stats history: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+    return;
+  }
+
+  if (method === 'POST' && path === '/api/stats-history/refresh') {
+    if (!requireJsonContentType(req, res)) return;
+    const body = await readJsonBody<Record<string, never>>(req, res);
+    if (body === undefined) return;
+    try {
+      const snapshots = await deps.refreshStatsHistory();
+      sendJson(res, 200, { snapshots });
+    } catch (err) {
+      sendJson(res, 502, {
+        error: `could not refresh stats history: ${err instanceof Error ? err.message : String(err)}`,
       });
     }
     return;
