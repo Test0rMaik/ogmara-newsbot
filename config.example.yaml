@@ -199,7 +199,9 @@ profile:
   # Omit a field to leave it unchanged.
   # displayName: My News Bot
   # bio: Automated world-news posts. Not a human.
-  # avatarCid: Qm...            # IPFS CID of an avatar image
+  # avatarCid: Qm...            # IPFS CID of an avatar image — or skip this
+  #                             # entirely and upload an image directly from
+  #                             # the control panel's Settings tab instead.
 
   # Re-publish the profile on every startup. Off by default: an operator who
   # edits their profile elsewhere shouldn't have the bot silently revert it.

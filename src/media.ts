@@ -29,9 +29,29 @@ import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { Attachment, OgmaraClient } from '@ogmara/sdk';
 
-/** Raised when an image cannot be uploaded for a reason the operator must fix. */
+/**
+ * Raised when an image cannot be uploaded.
+ *
+ * `kind` distinguishes two genuinely different situations a caller mapping
+ * this to an HTTP status needs to tell apart: `'input'` means the bytes/type/
+ * size themselves are the problem (a 400-class response is correct —
+ * something the operator must fix by choosing a different file); `'unavailable'`
+ * means the NODE or network is the problem (IPFS backend down, connection
+ * failure — a 502-class response is correct, since nothing about the request
+ * itself was wrong). Defaults to `'input'` since most throw sites in this
+ * module are validation checks; the two throw sites inside `performUpload`'s
+ * catch block explicitly pass `'unavailable'`. Getting this wrong previously
+ * meant the panel's avatar-upload route reported "your request was
+ * malformed" (400) for a plain IPFS outage. (Code audit, 0.14.0.)
+ */
 export class MediaError extends Error {
   override readonly name = 'MediaError';
+  readonly kind: 'input' | 'unavailable';
+
+  constructor(message: string, kind: 'input' | 'unavailable' = 'input') {
+    super(message);
+    this.kind = kind;
+  }
 }
 
 /**
@@ -249,14 +269,18 @@ async function performUpload(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // The node answers 503 specifically when its IPFS backend is unreachable,
-    // which is an operator problem rather than a bad file.
+    // which is an operator/infrastructure problem, not a bad file — 'unavailable'.
     if (message.includes('503')) {
       throw new MediaError(
         'the node cannot accept media right now (IPFS backend offline). ' +
           'Check the node, or point the bot at a media-capable one.',
+        'unavailable',
       );
     }
-    throw new MediaError(`upload of "${filename}" failed: ${message}`);
+    // Any other upload failure here (timeout, connection reset, DNS) is also
+    // a network/node problem, never something about the bytes themselves —
+    // those were already validated above before this call was ever made.
+    throw new MediaError(`upload of "${filename}" failed: ${message}`, 'unavailable');
   }
 
   return {

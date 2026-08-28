@@ -16,6 +16,8 @@
  * an operator logs in with the extension they already have installed.
  */
 
+import { MAX_AVATAR_BYTES } from '../identity.js';
+
 /** Data the initial page needs before any JS runs. */
 export interface PageContext {
   botAddress: string;
@@ -96,9 +98,15 @@ export function renderPage(ctx: PageContext): string {
 
   .dashboard-toolbar { display: flex; justify-content: flex-end; margin-bottom: 0.6rem; }
   .secondary-btn { background: #1c1f27; color: #c8ccd2; border: 1px solid #2a2e38; border-radius: 6px;
-                    padding: 0.35rem 0.9rem; font-size: 0.85rem; cursor: pointer; font-family: inherit; }
+                    padding: 0.35rem 0.9rem; font-size: 0.85rem; cursor: pointer; font-family: inherit;
+                    display: inline-block; }
   .secondary-btn:hover:not(:disabled) { border-color: #3a6ff7; color: #e6e6e6; }
   .secondary-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  .avatar-row { display: flex; align-items: center; gap: 1rem; margin: 0.6rem 0; }
+  .avatar-preview { width: 64px; height: 64px; border-radius: 50%; object-fit: cover;
+                     background: #12141a; border: 1px solid #2a2e38; }
+  .avatar-picker { display: flex; gap: 0.5rem; align-items: center; }
 </style>
 </head>
 <body>
@@ -173,6 +181,17 @@ export function renderPage(ctx: PageContext): string {
       <label for="display-name">Display name</label>
       <input id="display-name" maxlength="64">
       <p><button id="profile-btn">Update profile</button></p>
+
+      <h3>Profile picture</h3>
+      <div class="avatar-row">
+        <img id="avatar-preview" class="avatar-preview" hidden alt="Profile picture">
+        <div class="avatar-picker">
+          <label for="avatar-file-input" class="secondary-btn">Choose image</label>
+          <input type="file" id="avatar-file-input" accept="image/jpeg,image/png,image/gif,image/webp" hidden>
+          <button id="avatar-upload-btn" class="secondary-btn" disabled>Upload avatar</button>
+        </div>
+      </div>
+      <p class="muted">JPEG, PNG, GIF or WebP, up to 5 MB.</p>
 
       <hr>
       <h2>Wallet registration</h2>
@@ -304,6 +323,7 @@ function switchTab(name) {
     refreshPosts();
     refreshChart();
   }
+  if (name === 'settings') refreshProfile();
 }
 
 /**
@@ -647,8 +667,134 @@ async function updateProfile() {
     showSuccess(
       result.status === 'updated' ? 'Profile updated.' : 'Nothing to update.',
     );
+    // The field now shows what was JUST published, so it's no longer an
+    // unsaved edit — the next refreshProfile() (e.g. after switching tabs
+    // and back) should feel free to re-sync it from the server again.
+    displayNameDirty = false;
   } catch (err) {
     showError(err.message || String(err));
+  }
+}
+
+// Exactly the four types media.ts's server-side allowlist accepts — kept in
+// sync so a rejection here doesn't send a misleading impression of what's
+// allowed. Interpolated from identity.ts's own MAX_AVATAR_BYTES, the actual
+// source of truth, rather than a second hardcoded 5 MB literal drifting out
+// of sync with it. (Code audit, 0.14.0.)
+const ALLOWED_AVATAR_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+const MAX_AVATAR_BYTES = ${MAX_AVATAR_BYTES};
+let selectedAvatarFile = null;
+let displayNameDirty = false;
+// The local blob: URL currently shown in the preview, if any — tracked so it
+// can be revoked before being replaced. blob: URLs pin their backing File in
+// memory until explicitly revoked; without this, picking several candidate
+// avatars before settling on one leaked every rejected one for the life of
+// the page. (Code audit, 0.14.0.)
+let avatarPreviewBlobUrl = null;
+
+function setAvatarPreviewBlobUrl(url) {
+  if (avatarPreviewBlobUrl) URL.revokeObjectURL(avatarPreviewBlobUrl);
+  avatarPreviewBlobUrl = url;
+}
+
+/** Load the bot's current profile and show it — the display name input was
+ *  previously always blank regardless of what was actually set, which read
+ *  as "no name configured" even when one genuinely was. */
+async function refreshProfile() {
+  try {
+    const profile = await api('/api/profile', { method: 'GET' });
+    const nameInput = document.getElementById('display-name');
+    // Only prefill while the operator hasn't touched the field this session
+    // (tracked explicitly via displayNameDirty, not just "is it empty" —
+    // typing a name and then deleting it back to empty must not make this
+    // re-fill from the server on the next tab switch). Cleared again after
+    // a successful save, so the field then correctly reflects "this is what
+    // was just published," not "this is what I once typed."
+    if (!displayNameDirty) nameInput.value = profile.displayName || '';
+
+    // Never clobber a locally staged, not-yet-uploaded file with the OLD
+    // server avatar — switching tabs and back used to silently swap the
+    // preview back to the previous image while the new file stayed armed,
+    // so clicking Upload published something different from what was on
+    // screen. (Code audit, 0.14.0.)
+    if (selectedAvatarFile === null) {
+      const preview = document.getElementById('avatar-preview');
+      if (profile.avatarCid) {
+        setAvatarPreviewBlobUrl(null);
+        preview.src = profile.nodeUrl + '/api/v1/media/' + encodeURIComponent(profile.avatarCid);
+        preview.hidden = false;
+      } else {
+        preview.hidden = true;
+      }
+    }
+  } catch (err) {
+    showError(err.message || String(err));
+  }
+}
+
+function onAvatarFileChange(event) {
+  const file = event.target.files[0];
+  const uploadBtn = document.getElementById('avatar-upload-btn');
+  const preview = document.getElementById('avatar-preview');
+  selectedAvatarFile = null;
+  uploadBtn.disabled = true;
+  if (!file) return;
+  if (!ALLOWED_AVATAR_TYPES.includes(file.type)) {
+    showError('Choose a JPEG, PNG, GIF or WebP image.');
+    preview.hidden = true;
+    return;
+  }
+  if (file.size === 0) {
+    showError('That file is empty.');
+    preview.hidden = true;
+    return;
+  }
+  if (file.size > MAX_AVATAR_BYTES) {
+    showError('That image is too large (max 5 MB).');
+    preview.hidden = true;
+    return;
+  }
+  showError('');
+  selectedAvatarFile = file;
+  uploadBtn.disabled = false;
+  // A local preview via a blob: URL, shown immediately — before the upload
+  // even starts — so the operator sees what they picked without waiting on
+  // a round trip. Replaced by the real node-hosted image once
+  // refreshProfile() runs again after a successful upload.
+  setAvatarPreviewBlobUrl(URL.createObjectURL(file));
+  preview.src = avatarPreviewBlobUrl;
+  preview.hidden = false;
+}
+
+async function uploadSelectedAvatar() {
+  if (!selectedAvatarFile) return;
+  showError('');
+  const btn = document.getElementById('avatar-upload-btn');
+  btn.disabled = true;
+  try {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error('could not read file'));
+      reader.readAsDataURL(selectedAvatarFile);
+    });
+    const imageBase64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+    await api('/api/profile/avatar', {
+      method: 'POST',
+      body: JSON.stringify({
+        imageBase64,
+        mimeType: selectedAvatarFile.type,
+        filename: selectedAvatarFile.name,
+      }),
+    });
+    showSuccess('Avatar updated.');
+    selectedAvatarFile = null;
+    document.getElementById('avatar-file-input').value = '';
+    await refreshProfile();
+  } catch (err) {
+    showError(err.message || String(err));
+  } finally {
+    btn.disabled = selectedAvatarFile === null;
   }
 }
 
@@ -694,6 +840,11 @@ async function ackBackup() {
 document.getElementById('login-btn').addEventListener('click', login);
 document.getElementById('logout-btn').addEventListener('click', logout);
 document.getElementById('profile-btn').addEventListener('click', updateProfile);
+document.getElementById('avatar-file-input').addEventListener('change', onAvatarFileChange);
+document.getElementById('avatar-upload-btn').addEventListener('click', uploadSelectedAvatar);
+document.getElementById('display-name').addEventListener('input', () => {
+  displayNameDirty = true;
+});
 document.getElementById('register-btn').addEventListener('click', register);
 document.getElementById('backup-ack-btn').addEventListener('click', ackBackup);
 document.getElementById('refresh-dashboard-btn').addEventListener('click', refreshDashboard);

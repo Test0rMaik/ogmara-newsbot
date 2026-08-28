@@ -15,15 +15,26 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net';
 import type { OgmaraClient, ScNetwork, WalletSigner } from '@ogmara/sdk';
 import type { ProfileResult, ProfileSpec, RegisterResult, RegistrationStatus } from '../identity.js';
+import { MAX_AVATAR_BYTES } from '../identity.js';
 import { REGISTRATION_COST_KLV } from '../klever.js';
+import { MediaError } from '../media.js';
 import type { StatsSnapshot } from '../statsHistory.js';
 import { PanelAuth } from './auth.js';
 import { TrustedProxies, isLoopback, resolveClientIp } from './clientip.js';
 import type { PostStats } from './posts.js';
 import { renderPage, renderScript } from './ui.js';
 
-/** Largest request body accepted. Every panel action fits in a few hundred bytes. */
+/** Largest request body accepted, for ordinary panel actions (every one fits in a few hundred bytes). */
 const MAX_BODY_BYTES = 16 * 1024;
+
+/**
+ * Largest AVATAR request body accepted. Avatars travel as base64 JSON
+ * (~4/3 inflation over raw bytes, matching `MAX_AVATAR_BYTES` in
+ * identity.ts) rather than multipart — this server has no multipart parser,
+ * and base64-in-JSON reuses the exact same body-reading path (and its size
+ * cap) every other panel route already goes through.
+ */
+const MAX_AVATAR_BODY_BYTES = Math.ceil((MAX_AVATAR_BYTES * 4) / 3) + 4096;
 
 /**
  * What the panel needs from the running bot to serve requests.
@@ -97,6 +108,26 @@ export interface PanelDeps {
    * re-reading whatever the last scheduled snapshot happened to record.
    */
   refreshStatsHistory: () => Promise<readonly StatsSnapshot[]>;
+  /**
+   * Base URL of the node this bot publishes through (`config.node.url`).
+   * Not secret — the operator already configured it — but needed so the
+   * dashboard can build a URL for the bot's own avatar image
+   * (`${nodeUrl}/api/v1/media/:cid`, the same public, unauthenticated
+   * endpoint every Ogmara client uses) and so the CSP's `img-src` can allow
+   * exactly that one origin rather than either blocking avatar previews
+   * entirely or opening `img-src` up to anything.
+   */
+  nodeUrl: string;
+  /** Read the bot's own profile back from the node, for the Settings tab. */
+  fetchProfile: () => Promise<ProfileSpec>;
+  /**
+   * Upload an avatar image and set it as the profile picture in one step.
+   * `bytes` are the raw (already base64-decoded) image bytes; `mimeType` is
+   * the browser's claimed type — verified against the real bytes downstream
+   * (see `identity.ts`'s `uploadAvatar` / `media.ts`'s magic-byte check)
+   * before anything reaches the node.
+   */
+  uploadAvatar: (bytes: Uint8Array, mimeType: string, filename: string) => Promise<{ avatarCid: string }>;
 }
 
 /** Per-instance mutable state, kept out of PanelDeps because it isn't config. */
@@ -112,6 +143,18 @@ interface PanelState {
    * makes the second request fail fast instead of racing the first.
    */
   registering: boolean;
+  /**
+   * True while an avatar upload is in flight.
+   *
+   * The avatar route accepts a body up to ~7 MB (vs. ~16 KB for every other
+   * panel action) and does real work per request (base64 decode, magic-byte
+   * check, an upload to the node) — a burst of concurrent uploads is real
+   * memory/CPU/node-load headroom that didn't exist before this route, even
+   * though it's auth-gated like everything else. Same rationale and shape as
+   * `registering` above: the second overlapping request fails fast (409)
+   * rather than doing redundant work in parallel. (Security audit, 0.14.0.)
+   */
+  uploadingAvatar: boolean;
 }
 
 /** A running panel instance. */
@@ -134,6 +177,11 @@ interface ProfileBody {
 interface RegisterBody {
   confirm?: unknown;
 }
+interface AvatarBody {
+  imageBase64?: unknown;
+  mimeType?: unknown;
+  filename?: unknown;
+}
 
 /**
  * Start the panel server.
@@ -142,10 +190,11 @@ interface RegisterBody {
  * @param port Port to listen on.
  */
 export function startPanel(bind: string, port: number, deps: PanelDeps): Promise<Panel> {
-  const state: PanelState = { registering: false };
+  const state: PanelState = { registering: false, uploadingAvatar: false };
+  const csp = buildCsp(deps.nodeUrl);
 
   const server = createServer((req, res) => {
-    void handle(req, res, deps, state).catch((err) => {
+    void handle(req, res, deps, state, csp).catch((err) => {
       console.error('panel: unhandled error:', err instanceof Error ? err.message : err);
       if (!res.headersSent) sendJson(res, 500, { error: 'internal error' });
     });
@@ -206,6 +255,7 @@ async function handle(
   res: ServerResponse,
   deps: PanelDeps,
   state: PanelState,
+  csp: string,
 ): Promise<void> {
   // Checked before anything else, for every route: a browser always sends
   // `Host` from the URL it navigated to, never from the IP that hostname
@@ -241,11 +291,11 @@ async function handle(
 
   // ── Unauthenticated routes ──────────────────────────────────────────
   if (method === 'GET' && path === '/') {
-    sendHtml(res, 200, renderPage({ botAddress: deps.botAddress, network: deps.network }));
+    sendHtml(res, 200, renderPage({ botAddress: deps.botAddress, network: deps.network }), csp);
     return;
   }
   if (method === 'GET' && path === '/app.js') {
-    sendScript(res, renderScript());
+    sendScript(res, renderScript(), csp);
     return;
   }
   if (method === 'GET' && path === '/api/auth/challenge') {
@@ -412,6 +462,90 @@ async function handle(
     return;
   }
 
+  if (method === 'GET' && path === '/api/profile') {
+    try {
+      const profile = await deps.fetchProfile();
+      // Origin only, not the raw configured URL: `node.url` is validated as
+      // a URL but not restricted from carrying embedded userinfo
+      // (`http://user:pass@host`) — echoing it verbatim would put that
+      // credential into the browser's history/devtools for no reason the
+      // client actually needs. `.origin` is exactly what ui.ts uses to build
+      // the avatar's media URL. (Security audit, 0.14.0.)
+      sendJson(res, 200, { ...profile, nodeUrl: new URL(deps.nodeUrl).origin });
+    } catch (err) {
+      sendJson(res, 502, {
+        error: `could not fetch profile: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+    return;
+  }
+
+  if (method === 'POST' && path === '/api/profile/avatar') {
+    if (!requireJsonContentType(req, res)) return;
+    // Same rationale as the registration guard above: this route accepts a
+    // much larger body and does real work (decode, magic-byte check, an
+    // upload to the node) per request — a second overlapping request should
+    // fail fast rather than run in parallel with the first.
+    if (state.uploadingAvatar) {
+      sendJson(res, 409, { error: 'an avatar upload is already in progress' });
+      return;
+    }
+    const body = await readJsonBody<AvatarBody>(req, res, MAX_AVATAR_BODY_BYTES);
+    if (body === undefined) return;
+    if (typeof body.imageBase64 !== 'string' || body.imageBase64.length === 0) {
+      sendJson(res, 400, { error: '"imageBase64" (non-empty string) is required' });
+      return;
+    }
+    if (typeof body.mimeType !== 'string' || body.mimeType.length === 0) {
+      sendJson(res, 400, { error: '"mimeType" (non-empty string) is required' });
+      return;
+    }
+    // Cosmetic only (forwarded to the node as the upload's filename) — but
+    // unbounded, it's still a multi-megabyte string reaching that call for
+    // no reason. A typical filesystem filename limit is plenty of headroom.
+    const rawFilename = typeof body.filename === 'string' ? body.filename.slice(0, 255) : '';
+    const filename = rawFilename.length > 0 ? rawFilename : 'avatar';
+
+    let bytes: Buffer;
+    try {
+      // `Buffer.from` with `'base64'` silently drops invalid characters
+      // rather than throwing, which could turn a corrupted upload into a
+      // truncated-but-"successful" one — validate the alphabet first so a
+      // malformed payload is rejected outright instead of silently mangled.
+      // Padding is exactly 0-2 trailing `=` (a real base64 quantum), not the
+      // unbounded `=*` an earlier version of this check used.
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(body.imageBase64) || body.imageBase64.length % 4 !== 0) {
+        throw new Error('not valid base64');
+      }
+      bytes = Buffer.from(body.imageBase64, 'base64');
+    } catch {
+      sendJson(res, 400, { error: '"imageBase64" is not valid base64' });
+      return;
+    }
+
+    state.uploadingAvatar = true;
+    try {
+      const result = await deps.uploadAvatar(bytes, body.mimeType, filename);
+      sendJson(res, 200, result);
+    } catch (err) {
+      // A MediaError with kind 'input' means the upload was rejected for a
+      // reason the OPERATOR must fix (wrong type, bytes don't match the
+      // claimed type, too large) — a 400. Everything else, INCLUDING a
+      // MediaError with kind 'unavailable' (the node's IPFS backend is
+      // down, a connection failure), is a 502 — the request itself was
+      // fine, the node/network wasn't. `MediaError` alone used to mean 400
+      // unconditionally, which misreported a plain node outage as a
+      // malformed request. (Code audit, 0.14.0.)
+      const status = err instanceof MediaError && err.kind === 'input' ? 400 : 502;
+      sendJson(res, status, {
+        error: `avatar upload failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    } finally {
+      state.uploadingAvatar = false;
+    }
+    return;
+  }
+
   if (method === 'POST' && path === '/api/register') {
     if (!requireJsonContentType(req, res)) return;
     const body = await readJsonBody<RegisterBody>(req, res);
@@ -519,8 +653,19 @@ function requireJsonContentType(req: IncomingMessage, res: ServerResponse): bool
   return true;
 }
 
-/** Read and parse a JSON body, enforcing the size cap. Writes the error response itself on failure. */
-function readJsonBody<T>(req: IncomingMessage, res: ServerResponse): Promise<T | undefined> {
+/**
+ * Read and parse a JSON body, enforcing a size cap. Writes the error response
+ * itself on failure.
+ *
+ * @param maxBytes Override the default cap — used by the avatar-upload route,
+ *   whose body is a base64-encoded image and needs far more than the ~16 KB
+ *   every other panel action fits in.
+ */
+function readJsonBody<T>(
+  req: IncomingMessage,
+  res: ServerResponse,
+  maxBytes: number = MAX_BODY_BYTES,
+): Promise<T | undefined> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let bytes = 0;
@@ -535,6 +680,11 @@ function readJsonBody<T>(req: IncomingMessage, res: ServerResponse): Promise<T |
     const fail = (status: number, message: string): void => {
       if (settled) return;
       settled = true;
+      // Release whatever was buffered so far — the request keeps draining
+      // (see above) but there's no reason to keep holding onto data that
+      // will never be parsed. Matters more now than when this was written:
+      // the avatar route raises the size cap ~437x over every other route's.
+      chunks.length = 0;
       sendJson(res, status, { error: message });
       resolve(undefined);
     };
@@ -542,7 +692,7 @@ function readJsonBody<T>(req: IncomingMessage, res: ServerResponse): Promise<T |
     req.on('data', (chunk: Buffer) => {
       if (settled) return;
       bytes += chunk.length;
-      if (bytes > MAX_BODY_BYTES) {
+      if (bytes > maxBytes) {
         fail(413, 'request body too large');
         return;
       }
@@ -656,26 +806,47 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
  * be this strict. `style-src 'unsafe-inline'` remains for the page's one
  * `<style>` block; that is a far weaker injection vector than script and not
  * worth a third file to eliminate.
+ *
+ * `img-src` additionally allows exactly the configured node's origin (for
+ * the bot's own avatar, fetched from that node's public
+ * `/api/v1/media/:cid`) and `blob:` (for the local file preview shown before
+ * an avatar upload completes) — everything else stays `'self'`-only.
+ * Computed once per panel instance from `nodeUrl` rather than left at
+ * `default-src`'s implicit `'self'`, which would silently block the avatar
+ * image from ever loading.
  */
-const CSP = "default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'";
+function buildCsp(nodeUrl: string): string {
+  let nodeOrigin: string;
+  try {
+    nodeOrigin = new URL(nodeUrl).origin;
+  } catch {
+    // Should never happen — config.ts validates node.url as a URL — but a
+    // CSP that fails to build must not take the whole page down with it.
+    nodeOrigin = "'none'";
+  }
+  return (
+    "default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; " +
+    `img-src 'self' blob: ${nodeOrigin}; frame-ancestors 'none'`
+  );
+}
 
-function sendHtml(res: ServerResponse, status: number, html: string): void {
+function sendHtml(res: ServerResponse, status: number, html: string, csp: string): void {
   res.writeHead(status, {
     'Content-Type': 'text/html; charset=utf-8',
     'Content-Length': Buffer.byteLength(html),
     'X-Content-Type-Options': 'nosniff',
-    'Content-Security-Policy': CSP,
+    'Content-Security-Policy': csp,
     'X-Frame-Options': 'DENY',
   });
   res.end(html);
 }
 
-function sendScript(res: ServerResponse, script: string): void {
+function sendScript(res: ServerResponse, script: string, csp: string): void {
   res.writeHead(200, {
     'Content-Type': 'text/javascript; charset=utf-8',
     'Content-Length': Buffer.byteLength(script),
     'X-Content-Type-Options': 'nosniff',
-    'Content-Security-Policy': CSP,
+    'Content-Security-Policy': csp,
   });
   res.end(script);
 }

@@ -142,22 +142,49 @@ describe('uploadImageBytes', () => {
     expect(called).toBe(false);
   });
 
-  it('translates a 503 from the node into an operator-facing IPFS-offline message', async () => {
+  it('translates a 503 from the node into an operator-facing IPFS-offline message, marked unavailable not input', async () => {
     const client = fakeClient(async () => {
       throw new Error('request failed: 503 Service Unavailable');
     });
-    await expect(uploadImageBytes(client, VALID_JPEG, 'x.jpg', 'image/jpeg', 1024)).rejects.toThrow(
-      /IPFS backend offline/,
+    const err: MediaError = await uploadImageBytes(client, VALID_JPEG, 'x.jpg', 'image/jpeg', 1024).catch(
+      (e) => e,
     );
+    expect(err).toBeInstanceOf(MediaError);
+    expect(err.message).toMatch(/IPFS backend offline/);
+    // A caller mapping this to an HTTP status (the panel's avatar-upload
+    // route) must be able to tell "the node is down" (502) apart from
+    // "the file was bad" (400) — both throw the same MediaError class.
+    expect(err.kind).toBe('unavailable');
   });
 
-  it('wraps any other upload failure with the filename for context', async () => {
+  it('wraps any other upload failure with the filename for context, also marked unavailable', async () => {
     const client = fakeClient(async () => {
       throw new Error('network reset');
     });
-    await expect(uploadImageBytes(client, VALID_JPEG, 'x.jpg', 'image/jpeg', 1024)).rejects.toThrow(
-      /upload of "x.jpg" failed: network reset/,
+    const err: MediaError = await uploadImageBytes(client, VALID_JPEG, 'x.jpg', 'image/jpeg', 1024).catch(
+      (e) => e,
     );
+    expect(err).toBeInstanceOf(MediaError);
+    expect(err.message).toMatch(/upload of "x.jpg" failed: network reset/);
+    expect(err.kind).toBe('unavailable');
+  });
+
+  it('marks validation failures (empty, oversized, wrong type, bad signature) as input, not unavailable', async () => {
+    const neverCalled = async () => {
+      throw new Error('should not reach the network for an invalid upload');
+    };
+    const cases = [
+      () => uploadImageBytes(fakeClient(neverCalled), new Uint8Array(0), 'x.jpg', 'image/jpeg', 1024),
+      () => uploadImageBytes(fakeClient(neverCalled), VALID_JPEG, 'x.jpg', 'image/jpeg', 1),
+      () => uploadImageBytes(fakeClient(neverCalled), new Uint8Array([1]), 'x.mp4', 'video/mp4', 1024),
+      () =>
+        uploadImageBytes(fakeClient(neverCalled), new Uint8Array([1, 2, 3]), 'x.jpg', 'image/jpeg', 1024),
+    ];
+    for (const run of cases) {
+      const err: MediaError = await run().catch((e) => e);
+      expect(err).toBeInstanceOf(MediaError);
+      expect(err.kind).toBe('input');
+    }
   });
 });
 

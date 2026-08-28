@@ -72,6 +72,9 @@ interface StartOptions {
   queuedCount?: number;
   fetchStatsHistory?: PanelDeps['fetchStatsHistory'];
   refreshStatsHistory?: PanelDeps['refreshStatsHistory'];
+  nodeUrl?: string;
+  fetchProfile?: PanelDeps['fetchProfile'];
+  uploadAvatar?: PanelDeps['uploadAvatar'];
 }
 
 async function start(options: StartOptions = {}): Promise<{
@@ -86,6 +89,8 @@ async function start(options: StartOptions = {}): Promise<{
     fetchPostStats: ReturnType<typeof vi.fn>;
     fetchStatsHistory: ReturnType<typeof vi.fn>;
     refreshStatsHistory: ReturnType<typeof vi.fn>;
+    fetchProfile: ReturnType<typeof vi.fn>;
+    uploadAvatar: ReturnType<typeof vi.fn>;
   };
 }> {
   const auth = new PanelAuth({
@@ -129,6 +134,8 @@ async function start(options: StartOptions = {}): Promise<{
 
   const fetchStatsHistoryFn = vi.fn(options.fetchStatsHistory ?? (async () => []));
   const refreshStatsHistoryFn = vi.fn(options.refreshStatsHistory ?? (async () => []));
+  const fetchProfileFn = vi.fn(options.fetchProfile ?? (async () => ({})));
+  const uploadAvatarFn = vi.fn(options.uploadAvatar ?? (async () => ({ avatarCid: 'bafy-avatar' })));
 
   const deps: PanelDeps = {
     auth,
@@ -152,6 +159,9 @@ async function start(options: StartOptions = {}): Promise<{
     queuedCountFn: () => options.queuedCount ?? 0,
     fetchStatsHistory: fetchStatsHistoryFn,
     refreshStatsHistory: refreshStatsHistoryFn,
+    nodeUrl: options.nodeUrl ?? 'https://node.example.test',
+    fetchProfile: fetchProfileFn,
+    uploadAvatar: uploadAvatarFn,
   };
 
   const started = await startPanel('127.0.0.1', 0, deps);
@@ -168,6 +178,8 @@ async function start(options: StartOptions = {}): Promise<{
       fetchPostStats: fetchPostStatsFn,
       fetchStatsHistory: fetchStatsHistoryFn,
       refreshStatsHistory: refreshStatsHistoryFn,
+      fetchProfile: fetchProfileFn,
+      uploadAvatar: uploadAvatarFn,
     },
   };
 }
@@ -426,6 +438,234 @@ describe('/api/profile', () => {
     });
     expect(res.status).toBe(401);
     expect(fns.applyProfile).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/profile', () => {
+  it('returns the current profile plus nodeUrl, so the client can build an avatar URL', async () => {
+    const { baseUrl } = await start({
+      fetchProfile: async () => ({ displayName: 'World News Bot', avatarCid: 'bafy-abc' }),
+      nodeUrl: 'https://darkw0rld.example.test',
+    });
+    const res = await fetch(`${baseUrl}/api/profile`);
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.displayName).toBe('World News Bot');
+    expect(body.avatarCid).toBe('bafy-abc');
+    expect(body.nodeUrl).toBe('https://darkw0rld.example.test');
+  });
+
+  it('maps a fetch failure to 502 rather than crashing', async () => {
+    const { baseUrl } = await start({
+      fetchProfile: async () => {
+        throw new Error('node unreachable');
+      },
+    });
+    const res = await fetch(`${baseUrl}/api/profile`);
+    expect(res.status).toBe(502);
+  });
+
+  it('requires authentication for a non-local caller', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/profile`, { headers: { 'X-Forwarded-For': '203.0.113.9' } });
+    expect(res.status).toBe(401);
+    expect(fns.fetchProfile).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/profile/avatar', () => {
+  const validBody = { imageBase64: Buffer.from([1, 2, 3]).toString('base64'), mimeType: 'image/png' };
+
+  it('decodes the base64 payload and forwards raw bytes to uploadAvatar', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validBody, filename: 'me.png' }),
+    });
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.avatarCid).toBe('bafy-avatar');
+    expect(fns.uploadAvatar).toHaveBeenCalledWith(Buffer.from([1, 2, 3]), 'image/png', 'me.png');
+  });
+
+  it('defaults the filename when none is given', async () => {
+    const { baseUrl, fns } = await start();
+    await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBody),
+    });
+    expect(fns.uploadAvatar).toHaveBeenCalledWith(expect.anything(), 'image/png', 'avatar');
+  });
+
+  it('rejects a missing imageBase64 without calling uploadAvatar', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mimeType: 'image/png' }),
+    });
+    expect(res.status).toBe(400);
+    expect(fns.uploadAvatar).not.toHaveBeenCalled();
+  });
+
+  it('rejects a missing mimeType without calling uploadAvatar', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64: validBody.imageBase64 }),
+    });
+    expect(res.status).toBe(400);
+    expect(fns.uploadAvatar).not.toHaveBeenCalled();
+  });
+
+  it('rejects a payload containing invalid base64 characters, never reaching uploadAvatar', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64: 'not-valid-base64!!!', mimeType: 'image/png' }),
+    });
+    expect(res.status).toBe(400);
+    expect(fns.uploadAvatar).not.toHaveBeenCalled();
+  });
+
+  it("maps a MediaError with kind 'input' (bad image content) to 400 — a client input problem", async () => {
+    const { baseUrl } = await start({
+      uploadAvatar: async () => {
+        const { MediaError } = await import('../media.js');
+        throw new MediaError('does not look like a real image/png file', 'input');
+      },
+    });
+    const res = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBody),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("maps a MediaError with kind 'unavailable' (e.g. IPFS backend down) to 502, NOT 400", async () => {
+    // The real failure shape from media.ts's performUpload for a node/IPFS
+    // outage — regression coverage for a bug found by the code audit: an
+    // earlier version of this route treated every MediaError as a 400,
+    // which misreported a plain node outage as a malformed request.
+    const { baseUrl } = await start({
+      uploadAvatar: async () => {
+        const { MediaError } = await import('../media.js');
+        throw new MediaError('the node cannot accept media right now (IPFS backend offline)', 'unavailable');
+      },
+    });
+    const res = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBody),
+    });
+    expect(res.status).toBe(502);
+  });
+
+  it('maps a non-MediaError failure (e.g. a thrown network exception) to 502', async () => {
+    const { baseUrl } = await start({
+      uploadAvatar: async () => {
+        throw new Error('fetch failed');
+      },
+    });
+    const res = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBody),
+    });
+    expect(res.status).toBe(502);
+  });
+
+  it('rejects a second concurrent upload with 409 rather than running both in parallel', async () => {
+    let resolveFirst: (() => void) | undefined;
+    const { baseUrl } = await start({
+      uploadAvatar: () =>
+        new Promise((resolve) => {
+          resolveFirst = () => resolve({ avatarCid: 'bafy-1' });
+        }),
+    });
+    const first = fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBody),
+    });
+    // Give the first request time to set state.uploadingAvatar before firing the second.
+    await new Promise((r) => setTimeout(r, 20));
+    const second = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(validBody),
+    });
+    expect(second.status).toBe(409);
+    resolveFirst?.();
+    expect((await first).status).toBe(200);
+  });
+
+  it('rejects invalid trailing padding (more than 2 "=" characters), not just a bare length%4 check', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64: 'AA======', mimeType: 'image/png' }), // length 8, %4===0, but not a real quantum
+    });
+    expect(res.status).toBe(400);
+    expect(fns.uploadAvatar).not.toHaveBeenCalled();
+  });
+
+  it('truncates an excessively long filename rather than forwarding it whole', async () => {
+    const { fns, baseUrl } = await start();
+    const longName = 'x'.repeat(10_000) + '.png';
+    await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...validBody, filename: longName }),
+    });
+    const forwardedFilename = fns.uploadAvatar.mock.calls[0]?.[2] as string;
+    expect(forwardedFilename.length).toBeLessThanOrEqual(255);
+  });
+
+  it('requires Content-Type: application/json', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      body: JSON.stringify(validBody),
+    });
+    expect(res.status).toBe(415);
+    expect(fns.uploadAvatar).not.toHaveBeenCalled();
+  });
+
+  it('requires authentication for a non-local caller', async () => {
+    const { baseUrl, fns } = await start();
+    const res = await fetch(`${baseUrl}/api/profile/avatar`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '203.0.113.9' },
+      body: JSON.stringify(validBody),
+    });
+    expect(res.status).toBe(401);
+    expect(fns.uploadAvatar).not.toHaveBeenCalled();
+  });
+});
+
+describe('CSP img-src for the avatar', () => {
+  it("allows the configured node's origin and blob:, not just 'self'", async () => {
+    const { baseUrl } = await start({ nodeUrl: 'https://darkw0rld.example.test:8443/' });
+    const res = await fetch(`${baseUrl}/`);
+    const csp = res.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain('img-src');
+    expect(csp).toContain('https://darkw0rld.example.test:8443');
+    expect(csp).toContain('blob:');
+  });
+
+  it('never widens script-src or default-src to accommodate the avatar', async () => {
+    const { baseUrl } = await start();
+    const res = await fetch(`${baseUrl}/`);
+    const csp = res.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).not.toMatch(/script-src[^;]*(https?:|\*)/);
   });
 });
 

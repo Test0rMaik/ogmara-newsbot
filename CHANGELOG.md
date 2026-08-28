@@ -5,6 +5,72 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-08-28
+
+### Added
+
+- **Avatar upload from the control panel.** The Settings tab can now upload
+  and set a profile picture directly — pick a JPEG, PNG, GIF or WebP up to
+  5 MB, and it's uploaded to IPFS through your node and set as the avatar in
+  one step (`GET /api/profile`, `POST /api/profile/avatar`). Reuses the same
+  magic-byte-verified, allowlisted upload path (`media.ts`) the RSS feed-image
+  feature added earlier — an operator's own upload is more trusted than a
+  hostile feed's, but there's no reason to skip a check that costs nothing.
+- **The Settings tab now shows the display name actually set**, instead of
+  always starting blank regardless of what was configured — which read as
+  "no name configured" even when one genuinely was.
+
+### Security
+
+Found by the mandatory code/security audit pass on this feature (image
+upload is the one area this project has already had to harden twice this
+cycle, so it got the same treatment again here):
+
+- The page's CSP now varies by config for the first time (`img-src` allows
+  the configured node's origin, so the browser can load the bot's own avatar
+  from that node's public `/api/v1/media/:cid`) — audited as new attack
+  surface rather than a minor tweak. Verified not attacker-steerable: built
+  once per panel instance from `config.node.url` (operator-configured,
+  zod-validated as a URL), never from a request.
+- `GET /api/profile` sent the raw configured node URL to the browser, which
+  can legally carry embedded credentials (`http://user:pass@host`) per the
+  URL spec even though nothing in this project ever sets them that way — now
+  sends only the origin, which is all the client needs anyway.
+- The avatar-upload route accepts a much larger body (~7 MB) than every
+  other panel action (~16 KB) and does real work per request — an in-flight
+  guard (mirroring the existing registration guard) now rejects a second
+  concurrent upload with 409 instead of running both in parallel.
+- Tightened the base64 padding check (was `=*`, unbounded; now `={0,2}`, an
+  actual base64 quantum) and capped the uploaded filename length (cosmetic,
+  forwarded to the node, previously unbounded).
+
+### Fixed
+
+- **`MediaError` conflated two different failure classes**, both mapped to
+  HTTP 400 by the avatar route: bad input (wrong file type, size, or bytes
+  that don't match the claimed type — genuinely the operator's to fix) and
+  node/network unavailability (IPFS backend down, connection failure —
+  nothing wrong with the request). A plain IPFS outage was being reported as
+  "your request was malformed." `MediaError` now carries a `kind: 'input' |
+  'unavailable'` discriminator, and the route maps only `'input'` to 400.
+- The avatar preview leaked a `blob:` object URL on every file selection
+  (never revoked) — picking through several candidate images before
+  settling on one could pin tens of megabytes in the tab indefinitely.
+- Switching away from and back to the Settings tab while a newly picked
+  avatar was staged but not yet uploaded silently replaced the preview with
+  the OLD avatar, while the new file stayed armed and the Upload button
+  stayed enabled — clicking Upload would have published something different
+  from what was on screen.
+- The display-name field's "don't clobber an in-progress edit" guard checked
+  only whether the field was currently empty, which meant typing a name and
+  then deleting it back to empty made the guard think nothing had been
+  touched. Now tracked with an explicit dirty flag, cleared on successful
+  save.
+- The client-side avatar file check accepted anything `image/*` (including
+  SVG), broader than the server's four-type allowlist — now matches exactly,
+  and a rejected file properly clears any previously shown preview instead
+  of leaving it displayed.
+
 ## [0.13.0] - 2026-08-28
 
 ### Fixed

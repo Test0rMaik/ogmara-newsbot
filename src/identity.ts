@@ -16,6 +16,7 @@ import {
   invokeContract,
   stringToHex,
 } from './klever.js';
+import { uploadImageBytes } from './media.js';
 
 /** What the bot's profile should say. */
 export interface ProfileSpec {
@@ -49,6 +50,52 @@ export async function applyProfile(
 
   await client.updateProfile(data);
   return { status: 'updated', displayName: spec.displayName };
+}
+
+/**
+ * Read the bot's own profile back from the node.
+ *
+ * Used by the control panel's Settings tab so it can show what's actually
+ * set — without this, the display-name field always started blank, which
+ * looked like "no name is set" even when one genuinely was, since nothing
+ * ever populated the input with the current value.
+ */
+export async function fetchProfile(client: OgmaraClient, address: string): Promise<ProfileSpec> {
+  const { user } = await client.getUserProfile(address);
+  return {
+    ...(user.display_name !== undefined ? { displayName: user.display_name } : {}),
+    ...(user.bio !== undefined ? { bio: user.bio } : {}),
+    ...(user.avatar_cid !== undefined ? { avatarCid: user.avatar_cid } : {}),
+  };
+}
+
+/**
+ * Largest avatar image accepted, in bytes. Avatars are small by nature; this
+ * is generous headroom without inviting someone to upload something IPFS
+ * has to pin at full node-upload-cap size just to be a profile picture.
+ */
+export const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Upload an avatar image and set it as the bot's profile picture in one step.
+ *
+ * Reuses `media.ts`'s `uploadImageBytes` — the exact same magic-byte-verified,
+ * allowlisted (jpeg/png/gif/webp only) upload path the RSS-image feature
+ * uses — rather than a separate, looser check for panel-uploaded images. An
+ * operator's own upload is more trusted than a hostile feed's, but there's
+ * no reason to skip a validation that costs nothing and closes the same
+ * class of "claimed image type doesn't match the actual bytes" gap either
+ * way.
+ */
+export async function uploadAvatar(
+  client: OgmaraClient,
+  bytes: Uint8Array,
+  mimeType: string,
+  filename: string,
+): Promise<{ avatarCid: string }> {
+  const attachment = await uploadImageBytes(client, bytes, filename, mimeType, MAX_AVATAR_BYTES);
+  await applyProfile(client, { avatarCid: attachment.cid });
+  return { avatarCid: attachment.cid };
 }
 
 /** The bot's on-chain registration state and what it implies. */

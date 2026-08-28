@@ -275,6 +275,13 @@ npm run dev -- --set-profile
 Publishes to your node as a signed profile update. Works on an unregistered
 wallet, and is last-write-wins, so re-running is harmless.
 
+The control panel's Settings tab (`panel.enabled: true`) does the same thing
+from the browser: it shows the display name currently set (the field starts
+pre-filled, not blank), and lets you upload and set a profile picture
+directly — pick a JPEG, PNG, GIF or WebP up to 5 MB, and it's uploaded to
+IPFS through your node and set as the avatar in one step. No `config.yaml`
+edit or restart needed for either.
+
 ### Registering the wallet (6x the posting limit)
 
 The node caps posts per wallet, and the cap depends on whether that wallet is

@@ -20,7 +20,7 @@ import {
   type WalletBootstrapResult,
 } from './bootstrap.js';
 import { ConfigError, loadConfig, loadSecrets, type Config, type Secrets } from './config.js';
-import { applyProfile, checkRegistration, registerWallet } from './identity.js';
+import { applyProfile, checkRegistration, fetchProfile, registerWallet, uploadAvatar } from './identity.js';
 import { KleverError, REGISTRATION_COST_KLV } from './klever.js';
 import { Ledger } from './ledger.js';
 import { LockError, acquireDataLock } from './lock.js';
@@ -759,6 +759,9 @@ async function startControlPanel(
       await takeStatsSnapshotNow();
       return statsHistory.all();
     },
+    nodeUrl: config.node.url,
+    fetchProfile: () => fetchProfile(publisher.client, publisher.address),
+    uploadAvatar: (bytes, mimeType, filename) => uploadAvatar(publisher.client, bytes, mimeType, filename),
   });
 
   console.log(

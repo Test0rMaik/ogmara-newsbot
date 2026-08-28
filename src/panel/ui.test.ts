@@ -376,6 +376,114 @@ describe('refreshChart force parameter', () => {
   });
 });
 
+describe('profile: current display name and avatar', () => {
+  it('switching to the Settings tab loads the current profile', () => {
+    const fn = extractFunction(script, 'switchTab');
+    expect(fn).toContain('refreshProfile()');
+  });
+
+  it('refreshProfile fetches /api/profile and never uses innerHTML', () => {
+    const fn = extractFunction(script, 'refreshProfile');
+    expect(fn).toContain("api('/api/profile'");
+    expect(script).not.toContain('innerHTML');
+  });
+
+  it('only prefills the display-name input while it has not been edited this session (tracked via a dirty flag, not just emptiness)', () => {
+    // A bare "is the input empty" check would re-clobber a value the
+    // operator typed and then deleted back to empty. An explicit dirty flag
+    // — set on the input's own 'input' event, cleared after a successful
+    // save — is what actually distinguishes "never touched" from "touched
+    // and then cleared." (Code audit, 0.14.0.)
+    const fn = extractFunction(script, 'refreshProfile');
+    expect(fn).toMatch(/if \(!displayNameDirty\)/);
+    expect(script).toContain(
+      "getElementById('display-name').addEventListener('input', () => {\n  displayNameDirty = true;\n});",
+    );
+    expect(extractFunction(script, 'updateProfile')).toContain('displayNameDirty = false;');
+  });
+
+  it('builds the avatar preview URL from nodeUrl + the media endpoint, and hides it when there is no avatar', () => {
+    const fn = extractFunction(script, 'refreshProfile');
+    expect(fn).toContain("'/api/v1/media/'");
+    expect(fn).toMatch(/preview\.hidden = true/);
+  });
+
+  it('never overwrites a locally staged, not-yet-uploaded avatar with the old server-confirmed one', () => {
+    // Regression coverage: switching tabs away and back used to re-run
+    // refreshProfile(), which unconditionally reset the preview to the OLD
+    // avatar even while a newly picked file was still staged and the
+    // Upload button still enabled — so what was on screen and what Upload
+    // would actually publish could silently diverge. (Code audit, 0.14.0.)
+    const fn = extractFunction(script, 'refreshProfile');
+    expect(fn).toMatch(/if \(selectedAvatarFile === null\) \{/);
+  });
+
+  it('has a file input restricted to the four accepted image types', () => {
+    expect(page).toMatch(
+      /accept="image\/jpeg,image\/png,image\/gif,image\/webp"/,
+    );
+  });
+
+  it('validates the chosen file client-side against the exact same four types the server allows, plus size', () => {
+    // Previously `file.type.startsWith('image/')` — broader than the
+    // server's allowlist, so an SVG (or anything else "image/*") would
+    // preview locally before being rejected server-side with a confusing
+    // error. (Code audit, 0.14.0.)
+    expect(script).toContain(
+      "const ALLOWED_AVATAR_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];",
+    );
+    const fn = extractFunction(script, 'onAvatarFileChange');
+    expect(fn).toContain('ALLOWED_AVATAR_TYPES.includes(file.type)');
+    expect(fn).toMatch(/file\.size === 0/);
+    expect(fn).toMatch(/file\.size > MAX_AVATAR_BYTES/);
+    expect(fn).toContain('uploadBtn.disabled = true');
+  });
+
+  it('resets the preview when a chosen file is rejected, rather than leaving a stale image showing', () => {
+    const fn = extractFunction(script, 'onAvatarFileChange');
+    const rejectionBranches = fn.split('return;').slice(0, -1);
+    for (const branch of rejectionBranches) {
+      if (branch.includes('showError(')) expect(branch).toMatch(/preview\.hidden = true/);
+    }
+  });
+
+  it('shows an immediate local preview via a blob: URL on file selection, revoking any previous one first', () => {
+    const fn = extractFunction(script, 'onAvatarFileChange');
+    expect(fn).toContain('setAvatarPreviewBlobUrl(URL.createObjectURL(file))');
+    const revokeFn = extractFunction(script, 'setAvatarPreviewBlobUrl');
+    expect(revokeFn).toContain('URL.revokeObjectURL(avatarPreviewBlobUrl)');
+  });
+
+  it('uploadSelectedAvatar reads the file as base64 and posts it to /api/profile/avatar', () => {
+    const fn = extractFunction(script, 'uploadSelectedAvatar');
+    expect(fn).toContain("api('/api/profile/avatar'");
+    expect(fn).toContain('readAsDataURL');
+    // Strips the "data:image/png;base64," prefix rather than sending the
+    // whole data URL — the server expects raw base64.
+    expect(fn).toMatch(/dataUrl\.slice\(dataUrl\.indexOf\(','\) \+ 1\)/);
+  });
+
+  it('re-fetches the confirmed profile after a successful upload, rather than trusting the local preview alone', () => {
+    const fn = extractFunction(script, 'uploadSelectedAvatar');
+    expect(fn).toMatch(/showSuccess\(/);
+    expect(fn).toContain('refreshProfile()');
+  });
+
+  it('disables the upload button again after a successful upload, but leaves it enabled to retry after a failure', () => {
+    const fn = extractFunction(script, 'uploadSelectedAvatar');
+    expect(fn).toMatch(/finally[\s\S]*btn\.disabled = selectedAvatarFile === null/);
+  });
+
+  it('wires both the file-input change and the upload-button click', () => {
+    expect(script).toContain(
+      "getElementById('avatar-file-input').addEventListener('change', onAvatarFileChange)",
+    );
+    expect(script).toContain(
+      "getElementById('avatar-upload-btn').addEventListener('click', uploadSelectedAvatar)",
+    );
+  });
+});
+
 /** Pull one `[async] function name() { ... }` body out of the generated script, braces balanced. */
 function extractFunction(source: string, name: string): string {
   const start =
