@@ -79,7 +79,16 @@ const postingSchema = z
      */
     dryRun: z.boolean().default(true),
     contentRating: contentRating.default('general'),
-    /** Bot's own posting cadence ceiling. Validated against the node's limits. */
+    /**
+     * Bot's own posting cadence ceiling.
+     *
+     * Not validated against the node's daily limit here — whether that limit
+     * is `nodeDailyUnverified` or `nodeDailyRegistered` depends on the
+     * wallet's actual on-chain registration status, which is only knowable
+     * with a network call, and config validation is synchronous with none.
+     * `index.ts` checks this for real once registration status is known at
+     * startup, and warns (without blocking) rather than failing here.
+     */
     maxPostsPerHour: z.number().positive().max(100).default(1),
     /**
      * What the node allows per wallet. Mirrors `[api.rate_limits]` in
@@ -102,21 +111,7 @@ const postingSchema = z
     alwaysTags: z.array(z.string()).max(10).default([]),
     /** Always append the source article link for feed-derived posts. */
     includeSourceLink: z.boolean().default(true),
-  })
-  .refine(
-    // Check against the UNVERIFIED daily ceiling, which is the tier every
-    // wallet starts in — a config that only works once registered would let
-    // the bot start and then fail against the node. 80% rather than 100%
-    // leaves room for retries and for posts made by the same wallet elsewhere.
-    (p) => p.maxPostsPerHour * 24 <= p.nodeDailyUnverified * 0.8,
-    {
-      message:
-        'posting.maxPostsPerHour x 24h exceeds 80% of posting.nodeDailyUnverified. ' +
-        'Every wallet starts unverified, so a higher cadence would fail against the node ' +
-        'until you register (see `--register`, which raises the daily ceiling 6x)',
-      path: ['maxPostsPerHour'],
-    },
-  );
+  });
 
 const feedSchema = z.object({
   url: z.url({ protocol: /^https?$/ }),

@@ -5,6 +5,28 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-08-28
+
+### Fixed
+
+- **`posting.maxPostsPerHour` could reject a valid config for a registered
+  wallet.** Config validation ran at load time, before the bot ever contacts
+  the chain — so it had no way to know a wallet had actually registered, and
+  always validated the configured cadence against the *unverified* daily
+  ceiling (50/day) regardless. A registered wallet (300/day) raising its
+  cadence to match — e.g. `maxPostsPerHour: 2` — hit a hard `ConfigError` and
+  the bot refused to start, even though 2/hour is nowhere near the wallet's
+  real limit. The check is now a runtime warning instead: `index.ts` checks
+  the configured cadence against the wallet's *actual* current tier once
+  registration status is known from the chain at startup, and only warns
+  (never blocks) if it's tight — matching how every other cadence-vs-limit
+  mismatch in this bot is already handled.
+
+### Added
+
+- **Dashboard refresh button.** Reloads the post list, stats, and chart in
+  place — no more full browser refresh needed to see new data.
+
 ## [0.11.0] - 2026-08-27
 
 Feedback from the first real day of live posting: an illustrative image on

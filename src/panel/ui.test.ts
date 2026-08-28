@@ -246,11 +246,16 @@ describe('dashboard tab', () => {
 });
 
 describe('engagement history chart', () => {
-  it('is present as the first element inside the dashboard tab', () => {
+  it('is the first content section inside the dashboard tab, right after the toolbar', () => {
     const dashboardDiv = /<div id="tab-dashboard"[^>]*>([\s\S]*?)<div id="tab-settings"/.exec(page);
     expect(dashboardDiv).not.toBeNull();
     const dashboardStart = dashboardDiv![1]!.trimStart();
-    expect(dashboardStart.startsWith('<div class="chart-card">')).toBe(true);
+    expect(dashboardStart.startsWith('<div class="dashboard-toolbar">')).toBe(true);
+    // The chart itself is the first thing after the toolbar — still "first
+    // part of the dashboard" in the sense that matters (before quick-stats,
+    // posts, hashtags), just not literally byte zero of the tab.
+    const afterToolbar = dashboardStart.slice(dashboardStart.indexOf('</div>') + '</div>'.length).trimStart();
+    expect(afterToolbar.startsWith('<div class="chart-card">')).toBe(true);
   });
 
   it('has one metric button per reactions/reposts/comments, and one range button per monthly/yearly/overall', () => {
@@ -322,6 +327,26 @@ describe('engagement history chart', () => {
   it('wires click listeners for both the metric and range buttons', () => {
     expect(script).toContain("querySelectorAll('.chart-metric-btn')");
     expect(script).toContain("querySelectorAll('.range-btn')");
+  });
+});
+
+describe('dashboard refresh button', () => {
+  it('exists and is wired to a click listener', () => {
+    expect(page).toContain('id="refresh-dashboard-btn"');
+    expect(script).toContain("getElementById('refresh-dashboard-btn').addEventListener('click', refreshDashboard)");
+  });
+
+  it('reloads both posts and the chart, without a full page reload', () => {
+    const fn = extractFunction(script, 'refreshDashboard');
+    expect(fn).toContain('refreshPosts()');
+    expect(fn).toContain('refreshChart()');
+    expect(script).not.toContain('location.reload');
+  });
+
+  it('disables itself while the refresh is in flight, and re-enables afterward even on failure', () => {
+    const fn = extractFunction(script, 'refreshDashboard');
+    expect(fn).toMatch(/\.disabled = true/);
+    expect(fn).toMatch(/finally[\s\S]*\.disabled = false/);
   });
 });
 

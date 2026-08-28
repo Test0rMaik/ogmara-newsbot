@@ -315,6 +315,11 @@ export class OgmaraPublisher {
     this.#registered = registered;
   }
 
+  /** Whether the wallet is currently believed to be registered on-chain. */
+  get registered(): boolean {
+    return this.#registered;
+  }
+
   /** The node's daily ceiling for this wallet's current tier. */
   get dailyLimit(): number {
     return this.#registered

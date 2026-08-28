@@ -131,7 +131,11 @@ attempt each hour is queued and published once budget frees up, not dropped,
 but not published right away either (see
 [Rate limits and the retry queue](#rate-limits-and-the-retry-queue)). Raise
 **both** if you want a faster cadence. The bot warns at startup if your
-schedules can fire more often than `maxPostsPerHour` allows.
+schedules can fire more often than `maxPostsPerHour` allows, and separately
+if `maxPostsPerHour` itself exceeds 80% of your wallet's *actual* current
+daily ceiling (50/day unverified, 300/day registered) — checked against
+whichever tier the node confirms at startup, never assumed, so raising your
+cadence after registering doesn't need a config workaround.
 
 ```yaml
 sources:

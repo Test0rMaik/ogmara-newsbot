@@ -93,6 +93,12 @@ export function renderPage(ctx: PageContext): string {
   .range-btn.active { color: #e6e6e6; border-color: #3a6ff7; }
   #chart-svg { width: 100%; height: 200px; background: #12141a; border: 1px solid #2a2e38;
                border-radius: 8px; display: block; }
+
+  .dashboard-toolbar { display: flex; justify-content: flex-end; margin-bottom: 0.6rem; }
+  .secondary-btn { background: #1c1f27; color: #c8ccd2; border: 1px solid #2a2e38; border-radius: 6px;
+                    padding: 0.35rem 0.9rem; font-size: 0.85rem; cursor: pointer; font-family: inherit; }
+  .secondary-btn:hover:not(:disabled) { border-color: #3a6ff7; color: #e6e6e6; }
+  .secondary-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -126,6 +132,10 @@ export function renderPage(ctx: PageContext): string {
     </nav>
 
     <div id="tab-dashboard" class="tab-content">
+      <div class="dashboard-toolbar">
+        <button id="refresh-dashboard-btn" class="secondary-btn">Refresh</button>
+      </div>
+
       <div class="chart-card">
         <nav class="chart-metrics">
           <button class="chart-metric-btn active" id="chart-metric-reactions" data-metric="reactions">Reactions</button>
@@ -548,6 +558,20 @@ async function refreshChart() {
   }
 }
 
+/** Reload every dashboard value in place — no full page reload needed. */
+async function refreshDashboard() {
+  const btn = document.getElementById('refresh-dashboard-btn');
+  btn.disabled = true;
+  try {
+    // Both already catch and display their own errors internally, so
+    // Promise.all here never rejects on a fetch failure — it only ever
+    // rejects on a genuine bug, which should surface rather than be masked.
+    await Promise.all([refreshPosts(), refreshChart()]);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function refresh() {
   let status;
   try {
@@ -658,6 +682,7 @@ document.getElementById('logout-btn').addEventListener('click', logout);
 document.getElementById('profile-btn').addEventListener('click', updateProfile);
 document.getElementById('register-btn').addEventListener('click', register);
 document.getElementById('backup-ack-btn').addEventListener('click', ackBackup);
+document.getElementById('refresh-dashboard-btn').addEventListener('click', refreshDashboard);
 for (const btn of document.querySelectorAll('.tab-btn')) {
   btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 }

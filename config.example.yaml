@@ -37,9 +37,10 @@ posting:
   # once budget frees up (see queue: below), not dropped, but not published
   # right away either. If you want e.g. 2 posts/hour, raise this to 2 AS WELL
   # AS setting a source's schedule to fire that often — raising only one of
-  # the two does nothing on its own. Checked at startup against the
-  # UNVERIFIED daily ceiling (every wallet starts there), with 80% headroom
-  # for retries.
+  # the two does nothing on its own. The bot warns at startup (never a hard
+  # failure) if this exceeds 80% of your wallet's ACTUAL current daily
+  # ceiling — unverified (50/day) or registered (300/day, see --register),
+  # whichever applies once the node confirms your on-chain status.
   maxPostsPerHour: 1
 
   # What the node allows per wallet. Two windows — a post is refused if EITHER

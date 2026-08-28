@@ -182,6 +182,32 @@ function renderPost(post: ComposedPost, address: string): void {
   console.log(`${'─'.repeat(68)}\n`);
 }
 
+/**
+ * Build a startup warning when the bot's configured cadence exceeds 80% of
+ * the wallet's ACTUAL current daily ceiling — never a hard error. The queue
+ * already parks and retries a rate-limited post rather than dropping it, and
+ * "will this exceed the node's limit" can only be answered once registration
+ * status is known from the chain, which config validation (synchronous, no
+ * network) structurally cannot do. Extracted as a pure function so the
+ * threshold logic has a direct unit test rather than relying on a full
+ * `run()` integration test.
+ */
+export function dailyBudgetWarning(
+  maxPostsPerHour: number,
+  dailyLimit: number,
+  registered: boolean,
+): string | undefined {
+  if (maxPostsPerHour * 24 <= dailyLimit * 0.8) return undefined;
+  return (
+    `Note: posting.maxPostsPerHour (${maxPostsPerHour}) x 24h ` +
+    `(${maxPostsPerHour * 24}) exceeds 80% of this wallet's current daily ceiling ` +
+    `(${dailyLimit}/day, ${registered ? 'registered' : 'unregistered'} tier). ` +
+    'Posts beyond the ceiling are queued and retried, not dropped (see "Rate limits and ' +
+    'the retry queue" in the README)' +
+    (registered ? '.' : ' — register the wallet to raise this 6x (`--register`).')
+  );
+}
+
 /** Build the enabled sources from config. */
 function buildSources(config: Config): Source[] {
   const sources: Source[] = [];
@@ -606,6 +632,17 @@ async function run(args: CliArgs): Promise<number> {
           'published as soon as they happen instead.',
       );
     }
+
+    // Same idea, checked against the wallet's REAL current tier (known only
+    // after the registration check above, hence a runtime warning here
+    // rather than a config-time error — config validation is synchronous
+    // and has no way to ask the chain whether this wallet is registered).
+    const budgetWarning = dailyBudgetWarning(
+      effective.posting.maxPostsPerHour,
+      publisher.dailyLimit,
+      publisher.registered,
+    );
+    if (budgetWarning !== undefined) console.log(`\n${budgetWarning}`);
   }
 
   console.log('\nRunning. Press Ctrl+C to stop.');
