@@ -326,18 +326,25 @@ Two tabs. **Dashboard** (the default view) opens with a **reactions / reposts
 / comments history chart** — switch metric via its own tabs, and time range
 via Monthly / Yearly / Overall — built from periodic snapshots the bot takes
 of your account's totals (`stats:` in the config; off only if you also turn
-off the panel). Below that: your last 25 posts, each linking out to its live
-page on [ogmara.org](https://ogmara.org), with their reaction/repost/comment
-counts; total published vs. currently queued; hashtag usage; and how long
-since the last successful post — the fastest way to notice an unattended bot
-has gone quiet. **Settings** holds the display name and wallet-registration
-controls.
+off the panel). Monthly and Yearly show **new activity per period** (reactions
+gained each day, or each month) rather than a running total, so a quiet day
+reads as flat and an active one as a spike; Overall shows the cumulative
+growth curve instead, since there's no larger period to bucket it against.
+The top-right number is labelled "so far" on Monthly/Yearly because it's
+always the current, still-in-progress day or month. Below that: your last 25
+posts, each linking out to its live page on [ogmara.org](https://ogmara.org),
+with their reaction/repost/comment counts; total published vs. currently
+queued; hashtag usage; and how long since the last successful post — the
+fastest way to notice an unattended bot has gone quiet. **Settings** holds the
+display name, avatar, and wallet-registration controls.
 
 The history chart needs at least two snapshots before it shows anything —
 expect an empty chart for the first `stats.schedule` interval (6 hours by
-default) after first enabling the panel. A **Refresh** button at the top of
-the Dashboard tab reloads everything in place (posts, stats, and the chart)
-without a browser refresh — clicking it also forces a brand-new chart
+default) after first enabling the panel, or a chart that falls back to
+showing raw totals for its first day or month until there's enough history to
+bucket into full periods. A **Refresh** button at the top of the Dashboard
+tab reloads everything in place (posts, stats, and the chart) without a
+browser refresh — clicking it also forces a brand-new chart
 snapshot right then, rather than waiting for the next scheduled one, so it's
 the fastest way to see fresh engagement numbers on demand.
 

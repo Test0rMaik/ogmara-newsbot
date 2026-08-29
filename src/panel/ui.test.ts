@@ -330,6 +330,186 @@ describe('engagement history chart', () => {
   });
 });
 
+describe('chart per-period deltas (Monthly/Yearly bucketing)', () => {
+  // Snapshots store a CUMULATIVE lifetime total (statsHistory.ts). Plotting
+  // that raw under "Monthly" — a day-labeled view — looked like a flat line
+  // that jumps once, which read as "reactions are summarizing" rather than
+  // showing per-day activity. bucketDeltaSeries converts the cumulative
+  // series into per-period NEW activity; these tests execute the real
+  // function against synthetic snapshot data rather than just pattern-
+  // matching the source, since the bucketing math is exactly the part that
+  // was wrong. (User feedback, 0.15.0.)
+  function loadBucketDeltaSeries() {
+    const bucketKeyFn = extractFunction(script, 'bucketKey');
+    const bucketDeltaSeriesFn = extractFunction(script, 'bucketDeltaSeries');
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    return new Function(`${bucketKeyFn}\n${bucketDeltaSeriesFn}\nreturn bucketDeltaSeries;`)();
+  }
+
+  function loadFormatChartDate() {
+    const fn = extractFunction(script, 'formatChartDate');
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    return new Function(`return (${fn});`)();
+  }
+
+  const DAY = 86_400_000;
+
+  it('computes per-day new activity as the delta between the last snapshot of each day, not the raw cumulative total', () => {
+    const bucketDeltaSeries = loadBucketDeltaSeries();
+    const day0 = new Date(2026, 7, 28).getTime(); // arbitrary local-time anchor, matching bucketKey's local getters
+    const history = [
+      { timestamp: day0 + 1000, totalReactions: 10 },
+      { timestamp: day0 + 2000, totalReactions: 12 }, // still day 0 — only the LAST value of the day should count
+      { timestamp: day0 + DAY + 1000, totalReactions: 15 }, // day 1
+      { timestamp: day0 + 2 * DAY + 1000, totalReactions: 15 }, // day 2, no new reactions at all
+    ];
+    const points = bucketDeltaSeries(history, day0 - DAY, 'day', 'totalReactions');
+    expect(points.map((p: any) => p.y)).toEqual([12, 3, 0]);
+  });
+
+  it('nets the first bucket in the window against the last snapshot BEFORE the window, not against zero', () => {
+    // Without this, the very first visible day would show its entire
+    // lifetime-to-date total as "new today" every time the window slides —
+    // e.g. a 30-day-old bot would show day -30's cumulative total as a
+    // single-day spike once it first entered the Monthly window.
+    const bucketDeltaSeries = loadBucketDeltaSeries();
+    const day0 = new Date(2026, 7, 28).getTime();
+    const history = [
+      { timestamp: day0 - 5 * DAY, totalReactions: 5 }, // before the window — the real baseline
+      { timestamp: day0 + 1000, totalReactions: 12 }, // first day inside the window
+      { timestamp: day0 + DAY + 1000, totalReactions: 20 },
+    ];
+    const points = bucketDeltaSeries(history, day0 - DAY, 'day', 'totalReactions');
+    expect(points.map((p: any) => p.y)).toEqual([7, 8]); // 12-5, then 20-12 — never 12-0
+  });
+
+  it('treats the very first snapshot ever as its own baseline (0), not an error', () => {
+    const bucketDeltaSeries = loadBucketDeltaSeries();
+    const day0 = new Date(2026, 7, 28).getTime();
+    const history = [{ timestamp: day0 + 1000, totalReactions: 9 }];
+    const points = bucketDeltaSeries(history, day0 - DAY, 'day', 'totalReactions');
+    expect(points).toEqual([{ timestamp: day0 + 1000, y: 9 }]);
+  });
+
+  it('allows a negative delta (net un-reactions within a period) rather than clamping it away', () => {
+    const bucketDeltaSeries = loadBucketDeltaSeries();
+    const day0 = new Date(2026, 7, 28).getTime();
+    const history = [
+      { timestamp: day0 + 1000, totalReactions: 20 },
+      { timestamp: day0 + DAY + 1000, totalReactions: 15 }, // net decrease
+    ];
+    const points = bucketDeltaSeries(history, day0 - DAY, 'day', 'totalReactions');
+    expect(points[1].y).toBe(-5);
+  });
+
+  it('finds the correct baseline even when history is not sorted ascending', () => {
+    // bucketDeltaSeries must not silently depend on statsHistory.ts's own
+    // sort-on-append guarantee — a hand-edited or externally rewritten
+    // stats-history.json could arrive out of order. (Code audit, 0.15.0.)
+    const bucketDeltaSeries = loadBucketDeltaSeries();
+    const day0 = new Date(2026, 7, 28).getTime();
+    const history = [
+      { timestamp: day0 + 1000, totalReactions: 50 }, // in-window, but listed FIRST despite being later
+      { timestamp: day0 - 5 * DAY, totalReactions: 5 }, // the real pre-window baseline, listed SECOND
+    ];
+    const points = bucketDeltaSeries(history, day0 - DAY, 'day', 'totalReactions');
+    expect(points).toEqual([{ timestamp: day0 + 1000, y: 45 }]); // 50 - 5, never 50 - 0
+  });
+
+  it('picks the later snapshot within a bucket even when two share the exact same millisecond', () => {
+    const bucketDeltaSeries = loadBucketDeltaSeries();
+    const day0 = new Date(2026, 7, 28).getTime();
+    const history = [
+      { timestamp: day0 + 1000, totalReactions: 5 },
+      { timestamp: day0 + 1000, totalReactions: 9 }, // identical timestamp, listed second — should win
+    ];
+    const points = bucketDeltaSeries(history, day0 - DAY, 'day', 'totalReactions');
+    expect(points).toEqual([{ timestamp: day0 + 1000, y: 9 }]);
+  });
+
+  it('buckets by calendar month for the Yearly granularity, not by day', () => {
+    const bucketDeltaSeries = loadBucketDeltaSeries();
+    const monthStart = new Date(2026, 0, 1).getTime(); // Jan 2026, local time
+    const history = [
+      { timestamp: new Date(2026, 0, 5).getTime(), totalReactions: 10 },
+      { timestamp: new Date(2026, 0, 25).getTime(), totalReactions: 18 }, // same month as above
+      { timestamp: new Date(2026, 1, 3).getTime(), totalReactions: 30 }, // February
+    ];
+    const points = bucketDeltaSeries(history, monthStart - DAY, 'month', 'totalReactions');
+    expect(points.map((p: any) => p.y)).toEqual([18, 12]); // Jan: 18-0, Feb: 30-18
+  });
+
+  it("renderChart only applies the raw-cumulative path (no bucketing) for the 'all' range", () => {
+    const fn = extractFunction(script, 'renderChart');
+    expect(fn).toMatch(/if \(granularity === 'raw'\) \{\s*\n\s*points = chartHistory\.map/);
+  });
+
+  it('only forces the y-axis floor to 0 when NOT plotting deltas — a bucketed delta must be able to show negative', () => {
+    // Tracked via the usingDeltas flag, not "granularity === raw" directly —
+    // the sparse-data fallback (see below) also produces a cumulative
+    // series even under a bucketed range, and that path needs the same
+    // floor-at-0 treatment a true raw/Overall series gets.
+    const fn = extractFunction(script, 'renderChart');
+    expect(fn).toMatch(/if \(!usingDeltas\) minY = Math\.min\(0, minY\);/);
+  });
+
+  it('falls back to raw within-window snapshots when bucketing yields fewer than 2 periods, instead of a blank chart', () => {
+    // Regression coverage: a brand-new bot (or several same-day snapshots)
+    // used to show "Not enough history yet" on Monthly/Yearly even with
+    // real data on screen for every OTHER tab, because bucketing by
+    // calendar day/month collapsed same-day data into a single point.
+    // (Code audit, 0.15.0.)
+    const fn = extractFunction(script, 'renderChart');
+    expect(fn).toMatch(/if \(bucketed\.length >= 2\)/);
+    expect(fn).toContain('usingDeltas = true;');
+    expect(fn).toMatch(/points = chartHistory\s*\n\s*\.filter\(\(s\) => s\.timestamp >= windowStart\)/);
+  });
+
+  it('snaps the window start to a bucket boundary before bucketing, so the first period is never partial', () => {
+    // Regression coverage: without this, the leftmost bucket only covered
+    // whatever fraction of the day/month happened to fall after
+    // `now - windowMs`, undercounting it — reproduced at ~15x low for a
+    // monthly bucket a few hours into the day. (Code audit, 0.15.0.)
+    const fn = extractFunction(script, 'renderChart');
+    expect(fn).toContain('const windowStart = bucketStart(now - windowMs, granularity);');
+  });
+
+  it('labels the latest value as "so far" only when it is a still-in-progress bucketed period, not a cumulative total', () => {
+    const fn = extractFunction(script, 'renderChart');
+    expect(fn).toMatch(/usingDeltas \? ys\[ys\.length - 1\] \+ ' so far' : String\(ys\[ys\.length - 1\]\)/);
+  });
+
+  it('formats a day bucket (and the raw/Overall path) as M/D', () => {
+    const formatChartDate = loadFormatChartDate();
+    const ms = new Date(2026, 7, 5, 12).getTime(); // Aug 5 2026, noon local time
+    expect(formatChartDate(ms, 'day')).toBe('8/5');
+    // 'raw' isn't a real branch in the function — it falls through to the
+    // same numeric path as 'day', which is what the Overall range relies on.
+    expect(formatChartDate(ms, 'raw')).toBe('8/5');
+  });
+
+  it('formats a month bucket using the environment\'s own locale formatting, not a hardcoded assumption', () => {
+    // Comparing against the SAME toLocaleDateString call the production code
+    // makes (rather than a hardcoded English-locale regex like /Aug.*2026/)
+    // means this test passes under any runtime locale instead of failing
+    // outside en-*/de-* environments while the real code is doing exactly
+    // the right, locale-aware thing. (Code audit, 0.15.0.)
+    const formatChartDate = loadFormatChartDate();
+    const ms = new Date(2026, 7, 5, 12).getTime();
+    const expected = new Date(ms).toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
+    expect(formatChartDate(ms, 'month')).toBe(expected);
+  });
+
+  it('bucketStart snaps to the start of the calendar day or month, in local time', () => {
+    const fn = extractFunction(script, 'bucketStart');
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const bucketStart = new Function(`return (${fn});`)();
+    const midDay = new Date(2026, 7, 15, 14, 30, 0).getTime(); // Aug 15 2026, 14:30 local
+    expect(bucketStart(midDay, 'day')).toBe(new Date(2026, 7, 15, 0, 0, 0, 0).getTime());
+    expect(bucketStart(midDay, 'month')).toBe(new Date(2026, 7, 1, 0, 0, 0, 0).getTime());
+  });
+});
+
 describe('dashboard refresh button', () => {
   it('exists and is wired to a click listener', () => {
     expect(page).toContain('id="refresh-dashboard-btn"');

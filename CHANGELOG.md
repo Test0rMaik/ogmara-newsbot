@@ -5,6 +5,52 @@ All notable changes to ogmara-newsbot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-08-29
+
+### Changed
+
+- **The history chart's Monthly/Yearly ranges now plot new activity per
+  period, not the running cumulative total.** Snapshots store a lifetime
+  total (see `statsHistory.ts`), and plotting that raw under "Monthly" — a
+  day-labelled view — produced a flat-then-jumping line that read as
+  "reactions are summarizing" rather than showing what happened on any given
+  day. Monthly now buckets by calendar day and Yearly by calendar month,
+  each point valued as the increase over the previous period; Overall keeps
+  plotting the raw cumulative total, since a growth curve is the right shape
+  when there's no larger period to bucket against. The top-right value is
+  now labelled "so far" on Monthly/Yearly, since it's always the current,
+  still-in-progress day or month.
+
+### Fixed
+
+Found by the mandatory code-audit pass on this change (the security audit
+came back clean — no new attack surface, since this only re-renders data
+that was already reaching the browser):
+
+- **The first bucket of every Monthly/Yearly chart was systematically
+  under-counted** — reproduced at up to 15x low on Yearly. The window's
+  start (`now - windowMs`) fell in the middle of whatever day/month it
+  landed on, so the leftmost period was always a partial slice rendered as
+  if it were a whole one. Now snapped down to the start of that calendar
+  day/month before bucketing, so the first period is always complete.
+- **A freshly enabled panel (or several same-day snapshots) showed "Not
+  enough history yet" on Monthly, and stayed blank on Yearly for up to a
+  full calendar month** — bucketing collapsed all same-day data into a
+  single point, which can't draw a line, even though real data existed and
+  every other tab showed it fine. Now falls back to plotting the raw
+  within-window snapshots when bucketing yields fewer than two periods,
+  rather than a blank chart when there's data to show.
+- The per-bucket delta calculation depended on `history` being sorted
+  ascending for its baseline lookup, undocumented and untrue in general
+  (only guaranteed for data the bot itself writes via `statsHistory.ts`'s
+  own sort-on-append, not for a hand-edited or externally rewritten
+  `stats-history.json`). Now sort-order-independent.
+- A same-millisecond tie between two snapshots in the same bucket picked the
+  first-encountered value rather than the later one.
+- Corrected inaccurate doc comments (claimed uniform per-period points when
+  a coverage gap actually produces no point at all; claimed the window-start
+  boundary was inclusive when the code treats it as exclusive).
+
 ## [0.14.0] - 2026-08-28
 
 ### Added

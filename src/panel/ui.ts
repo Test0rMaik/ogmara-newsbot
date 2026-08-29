@@ -444,7 +444,22 @@ let chartMetric = 'reactions';
 let chartRange = 'month';
 
 const CHART_METRIC_FIELD = { reactions: 'totalReactions', reposts: 'totalReposts', comments: 'totalComments' };
-const CHART_RANGE_MS = { month: 30 * 86400000, year: 365 * 86400000, all: Infinity };
+// One entry per range: how far back the window reaches, and what it plots.
+// Previously two parallel maps (ms + granularity) that had to be kept in
+// sync by hand — a range added to only one silently took a wrong,
+// plausible-looking path instead of erroring. Snapshots store a CUMULATIVE
+// lifetime total (see statsHistory.ts) — plotting that raw for "Monthly"
+// looked like a flat line that occasionally jumps, which read as "reactions
+// are summarizing" rather than showing what happened on any given day.
+// 'day'/'month' granularity buckets the cumulative series into per-period
+// NEW activity (the delta between consecutive snapshots); 'raw' plots the
+// cumulative total directly, which is the right shape for "Overall" — a
+// growth curve over the bot's whole history. (User feedback, 0.15.0.)
+const CHART_RANGES = {
+  month: { windowMs: 30 * 86400000, granularity: 'day' },
+  year: { windowMs: 365 * 86400000, granularity: 'month' },
+  all: { windowMs: Infinity, granularity: 'raw' },
+};
 
 /** Smallest and largest value in a plain array of finite numbers, without
  *  \`Math.min(...arr)\`/\`Math.max(...arr)\` — spreading into either blows the
@@ -460,9 +475,87 @@ function minMax(values) {
   return [min, max];
 }
 
-function formatChartDate(ms) {
+/** Calendar-bucket key for a timestamp — same day (or month) always maps to the same key, regardless of time of day. */
+function bucketKey(ms, granularity) {
   const d = new Date(ms);
+  return granularity === 'month'
+    ? d.getFullYear() + '-' + d.getMonth()
+    : d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
+}
+
+/**
+ * Start of the calendar day/month containing \`ms\`, in local time.
+ *
+ * Used to align a window's start to a bucket boundary before bucketing —
+ * without this, the window's raw \`now - windowMs\` cutoff fell in the
+ * MIDDLE of whatever day/month it landed on, so the leftmost bucket was
+ * always a partial period counted as if it were a whole one (verified: up
+ * to ~15x understated for a monthly bucket cut a few hours into the day).
+ * Snapping the start down means that first bucket is complete, and the
+ * existing baseline lookup in \`bucketDeltaSeries\` correctly finds the last
+ * snapshot before it. (Code audit, 0.15.0.)
+ */
+function bucketStart(ms, granularity) {
+  const d = new Date(ms);
+  return granularity === 'month'
+    ? new Date(d.getFullYear(), d.getMonth(), 1).getTime()
+    : new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+function formatChartDate(ms, granularity) {
+  const d = new Date(ms);
+  if (granularity === 'month') {
+    return d.toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
+  }
   return (d.getMonth() + 1) + '/' + d.getDate();
+}
+
+/**
+ * Turn a cumulative snapshot series into per-period NEW activity: one point
+ * per calendar day/month bucket that has AT LEAST ONE snapshot within the
+ * window, valued as the increase over the previous such bucket. A bucket
+ * with no snapshot at all (e.g. the bot was offline that day) produces no
+ * point — its activity is absorbed into whichever bucket resumes first,
+ * not spread out or zero-filled.
+ *
+ * The very first bucket is measured against the last snapshot STRICTLY
+ * BEFORE \`windowStart\` (found by scanning the FULL history, not just the
+ * windowed slice, and independent of \`history\`'s own sort order — a full
+ * scan tracking the latest qualifying timestamp, not a break on the first
+ * non-qualifying one) — falling back to 0 only when there's truly no
+ * earlier snapshot at all (the bot's very first ever), in which case that
+ * first bucket's "new" activity is simply everything accumulated by then.
+ * \`windowStart\` itself is expected to already be bucket-aligned (see
+ * \`bucketStart\`) — this function doesn't re-align it.
+ */
+function bucketDeltaSeries(history, windowStart, granularity, field) {
+  let baseline = 0;
+  let baselineTimestamp = -Infinity;
+  for (const s of history) {
+    if (s.timestamp < windowStart && s.timestamp >= baselineTimestamp) {
+      baseline = s[field];
+      baselineTimestamp = s.timestamp;
+    }
+  }
+
+  const lastInBucket = new Map();
+  for (const s of history) {
+    if (s.timestamp < windowStart) continue;
+    const key = bucketKey(s.timestamp, granularity);
+    const existing = lastInBucket.get(key);
+    if (!existing || s.timestamp >= existing.timestamp) {
+      lastInBucket.set(key, { timestamp: s.timestamp, total: s[field] });
+    }
+  }
+
+  const buckets = [...lastInBucket.values()].sort((a, b) => a.timestamp - b.timestamp);
+  const points = [];
+  let previousTotal = baseline;
+  for (const bucket of buckets) {
+    points.push({ timestamp: bucket.timestamp, y: bucket.total - previousTotal });
+    previousTotal = bucket.total;
+  }
+  return points;
 }
 
 function selectChartMetric(metric) {
@@ -492,9 +585,35 @@ function renderChart() {
   }
 
   const now = Date.now();
-  const windowMs = CHART_RANGE_MS[chartRange];
+  const { windowMs, granularity } = CHART_RANGES[chartRange];
   const field = CHART_METRIC_FIELD[chartMetric];
-  const points = chartHistory.filter((s) => windowMs === Infinity || now - s.timestamp <= windowMs);
+
+  // Tracks whether \`points\` ended up holding per-period DELTAS (true) or
+  // cumulative TOTALS (false) — the two need different y-axis floor and
+  // latest-value-label treatment below, and which one \`points\` actually
+  // holds depends on the fallback just below, not just on \`granularity\`.
+  let usingDeltas = false;
+  let points;
+  if (granularity === 'raw') {
+    points = chartHistory.map((s) => ({ timestamp: s.timestamp, y: s[field] }));
+  } else {
+    const windowStart = bucketStart(now - windowMs, granularity);
+    const bucketed = bucketDeltaSeries(chartHistory, windowStart, granularity, field);
+    // A brand-new bot (or a long snapshot gap) may not yet span 2 calendar
+    // buckets — e.g. several same-day snapshots under "Monthly" all collapse
+    // into ONE bucket, which can't draw a line. Falling back to the raw
+    // within-window snapshots shows the real data that exists instead of a
+    // misleading "not enough history" screen — nothing to compare against
+    // yet, so there's no "which day did this happen on" confusion to have.
+    if (bucketed.length >= 2) {
+      points = bucketed;
+      usingDeltas = true;
+    } else {
+      points = chartHistory
+        .filter((s) => s.timestamp >= windowStart)
+        .map((s) => ({ timestamp: s.timestamp, y: s[field] }));
+    }
+  }
 
   if (points.length < 2) {
     emptyEl.hidden = false;
@@ -512,17 +631,22 @@ function renderChart() {
   const pad = 28;
   svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
   const xs = points.map((p) => p.timestamp);
-  const ys = points.map((p) => p[field]);
+  const ys = points.map((p) => p.y);
   const [minX, maxX] = minMax(xs);
   let [minY, maxY] = minMax(ys);
-  minY = Math.min(0, minY);
+  // Deltas can legitimately go negative (net un-reactions/un-reposts within
+  // a period) — unlike a cumulative total (always >= 0, whether that's the
+  // true raw path or the sparse-data fallback above), this floor must not
+  // force 0 to always be the bottom of the range, or a genuinely negative
+  // period would be invisible, clipped below an axis that can't go that low.
+  if (!usingDeltas) minY = Math.min(0, minY);
   if (maxY === minY) maxY = minY + 1;
 
   const scaleX = (x) => pad + ((x - minX) / (maxX - minX || 1)) * (width - 2 * pad);
   const scaleY = (y) => height - pad - ((y - minY) / (maxY - minY)) * (height - 2 * pad);
 
   const ns = 'http://www.w3.org/2000/svg';
-  const coords = points.map((p) => scaleX(p.timestamp) + ',' + scaleY(p[field])).join(' ');
+  const coords = points.map((p) => scaleX(p.timestamp) + ',' + scaleY(p.y)).join(' ');
   const polyline = document.createElementNS(ns, 'polyline');
   polyline.setAttribute('points', coords);
   polyline.setAttribute('fill', 'none');
@@ -535,7 +659,7 @@ function renderChart() {
   startLabel.setAttribute('y', String(height - 8));
   startLabel.setAttribute('fill', '#9aa0a8');
   startLabel.setAttribute('font-size', '10');
-  startLabel.textContent = formatChartDate(minX);
+  startLabel.textContent = formatChartDate(minX, granularity);
   svg.appendChild(startLabel);
 
   const endLabel = document.createElementNS(ns, 'text');
@@ -544,7 +668,7 @@ function renderChart() {
   endLabel.setAttribute('fill', '#9aa0a8');
   endLabel.setAttribute('font-size', '10');
   endLabel.setAttribute('text-anchor', 'end');
-  endLabel.textContent = formatChartDate(maxX);
+  endLabel.textContent = formatChartDate(maxX, granularity);
   svg.appendChild(endLabel);
 
   const latestLabel = document.createElementNS(ns, 'text');
@@ -553,7 +677,12 @@ function renderChart() {
   latestLabel.setAttribute('fill', '#e6e6e6');
   latestLabel.setAttribute('font-size', '12');
   latestLabel.setAttribute('text-anchor', 'end');
-  latestLabel.textContent = String(ys[ys.length - 1]);
+  // The last bucket in a delta series is always the CURRENT, still-in-
+  // progress period (today, or this month) — labelling it identically to a
+  // cumulative total would silently change what the same bare number means
+  // depending on which range tab is active, with nothing on screen saying
+  // so. (Code audit, 0.15.0.)
+  latestLabel.textContent = usingDeltas ? ys[ys.length - 1] + ' so far' : String(ys[ys.length - 1]);
   svg.appendChild(latestLabel);
 }
 
